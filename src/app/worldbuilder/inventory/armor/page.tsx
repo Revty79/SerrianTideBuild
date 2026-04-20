@@ -1,0 +1,1514 @@
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
+import Link from "next/link";
+
+import { GradientText } from "@/components/GradientText";
+import { Card } from "@/components/Card";
+import { Button } from "@/components/Button";
+import { FormField } from "@/components/FormField";
+import { Input } from "@/components/Input";
+import { WBNav } from "@/components/worldbuilder/WBNav";
+import { InventoryNav } from "@/components/worldbuilder/InventoryNav";
+
+/* ---------- types & helpers ---------- */
+
+// how the item is used, from the builder's perspective
+type UsageType = "consumable" | "charges" | "at_will" | "other";
+type RechargeWindow = "none" | "scene" | "session" | "rest" | "day" | "custom";
+
+type ItemHookTrigger = "on_use" | "on_equip" | "passive" | "other";
+type ItemHookTarget = "self" | "ally" | "enemy" | "area" | "other";
+type ItemHookKind = "heal" | "damage" | "buff" | "debuff" | "utility" | "other";
+
+type ItemHook = {
+  id: string;
+  trigger: ItemHookTrigger;
+  target: ItemHookTarget;
+  kind: ItemHookKind;
+  amount?: number | null;
+  label: string; // plain effect text (e.g. "Restore 5 HP")
+};
+
+export type ArmorRow = {
+  id: string | number;
+  name: string;
+
+  is_free?: boolean;
+  createdBy?: string;
+
+  timeline_tag?: string | null;
+  cost_credits?: number | null;
+  durability?: number | null;
+
+  area_covered?: string | null;
+  soak?: number | null;
+  category?: string | null;
+  atype?: string | null;
+
+  genre_tags?: string | null;
+  weight?: number | null;
+  encumbrance_penalty?: number | null;
+  effect?: string | null;
+  narrative_notes?: string | null;
+
+  // legendary item properties
+  rarity?: string | null;
+  attunement?: string | null;
+  curse?: string | null;
+
+  // usage & structured effects (site-side only for now)
+  usage_type?: UsageType | null;
+  max_charges?: number | null;
+  recharge_window?: RechargeWindow | null;
+  recharge_notes?: string | null;
+  effect_hooks?: ItemHook[] | null;
+};
+
+const uid = () => Math.random().toString(36).slice(2, 10);
+const nv = (x: unknown) =>
+  x === null || x === undefined || x === "" ? "—" : String(x);
+
+const GENRE_PRESETS = [
+  "High Fantasy",
+  "Low Fantasy",
+  "Dark Fantasy",
+  "Urban Fantasy",
+  "Epic Fantasy",
+  "Sword & Sorcery",
+  "Grimdark",
+  "Post-Apocalyptic",
+  "Cyberpunk",
+  "Steampunk",
+  "Dieselpunk",
+  "Space Opera",
+  "Hard Sci-Fi",
+  "Soft Sci-Fi",
+  "Horror",
+  "Gothic Horror",
+  "Cosmic Horror",
+  "Supernatural",
+  "Historical",
+  "Alternate History",
+  "Modern Day",
+  "Western",
+  "Noir",
+  "Pulp Adventure",
+  "Superhero",
+  "Mystery",
+  "Thriller",
+  "Survival",
+  "Military",
+  "Political Intrigue",
+] as const;
+
+/* ---------- TSV batch parsing ---------- */
+
+function normalizeHeader(h: string): string {
+  return h.trim().toLowerCase().replace(/[()]/g, "");
+}
+
+function parseTSVToArmorRecords(raw: string): ArmorRow[] {
+  const trimmed = raw.trim();
+  if (!trimmed) return [];
+  const lines = trimmed.split(/\r?\n/).filter((l) => l.trim().length > 0);
+  if (lines.length < 2) {
+    throw new Error("Need a header row plus at least one data row.");
+  }
+
+  const headerCells = (lines[0] ?? "").split("\t").map((h) => h.trim());
+  const headersNorm = headerCells.map(normalizeHeader);
+
+  const findIndex = (...candidates: string[]) => {
+    for (const c of candidates) {
+      const norm = c.toLowerCase().replace(/[()]/g, "");
+      const i = headersNorm.findIndex((h) => h === norm);
+      if (i !== -1) return i;
+    }
+    return -1;
+  };
+
+  const records: ArmorRow[] = [];
+
+  for (let li = 1; li < lines.length; li++) {
+    const cols = (lines[li] ?? "").split("\t");
+
+    const get = (...names: string[]): string => {
+      const idx = findIndex(...names);
+      if (idx === -1) return "";
+      return (cols[idx] ?? "").trim();
+    };
+
+    const name = get("Armor Name", "Name");
+    if (!name) continue;
+
+    const timelineTag = get("Timeline Tag");
+    const costCredits = get("Cost Credits", "Cost");
+    const areaCovered = get("Area Covered");
+    const soak = get("Soak");
+    const category = get("Category");
+    const atype = get("Type");
+    const genreTags = get("Genre Tags");
+    const weight = get("Weight");
+    const encumbrancePenalty = get("Encomberence Penalty", "Encumbrance Penalty");
+    const effect = get("Effect");
+    const narrativeNotes = get("Narrative/Variant Notes", "Narrative Notes");
+
+    const rec: ArmorRow = {
+      id: uid(),
+      name,
+      is_free: false,
+      timeline_tag: timelineTag || null,
+      cost_credits: costCredits ? parseFloat(costCredits) : null,
+      area_covered: areaCovered || null,
+      soak: soak ? parseFloat(soak) : null,
+      category: category || null,
+      atype: atype || null,
+      genre_tags: genreTags || null,
+      weight: weight ? parseFloat(weight) : null,
+      encumbrance_penalty: encumbrancePenalty ? parseFloat(encumbrancePenalty) : null,
+      effect: effect || null,
+      narrative_notes: narrativeNotes || null,
+    };
+
+    records.push(rec);
+  }
+
+  return records;
+}
+
+/* ---------- main page ---------- */
+
+export default function InventoryArmorPage() {
+  const router = useRouter();
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        if (typeof window !== "undefined" && window.history.length > 1) {
+          router.back();
+        } else {
+          router.push("/worldbuilder/inventory");
+        }
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [router]);
+
+  const [armor, setArmor] = useState<ArmorRow[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [qtext, setQtext] = useState("");
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [currentUser, setCurrentUser] = useState<{
+    id: string;
+    role: string;
+  } | null>(null);
+  const [hooksByItem, setHooksByItem] = useState<Record<string, ItemHook[]>>(
+    {}
+  );
+
+  const [batchText, setBatchText] = useState("");
+  const [batchError, setBatchError] = useState<string | null>(null);
+  const [batchPreview, setBatchPreview] = useState<ArmorRow[]>([]);
+  const [batchUploading, setBatchUploading] = useState(false);
+  const isAdmin = currentUser?.role?.toLowerCase() === "admin";
+
+  useEffect(() => {
+    async function loadArmor() {
+      try {
+        const userRes = await fetch("/api/profile/me");
+        const userData = await userRes.json();
+        if (userData.ok && userData.user) {
+          setCurrentUser({ id: userData.user.id, role: userData.user.role });
+        }
+
+        const res = await fetch("/api/worldbuilder/inventory/armor");
+        const data = await res.json();
+        if (!data.ok) {
+          throw new Error(data.error || "Failed to load armor");
+        }
+
+        const mapped: ArmorRow[] = (data.armor || []).map((a: any) => ({
+          ...a,
+          is_free: a.isFree,
+          
+          // map camelCase from API to snake_case for UI
+          timeline_tag: a.timelineTag ?? a.timeline_tag ?? null,
+          cost_credits: a.costCredits ?? a.cost_credits ?? null,
+          area_covered: a.areaCovered ?? a.area_covered ?? null,
+          soak: a.soak ?? null,
+          genre_tags: a.genreTags ?? a.genre_tags ?? null,
+          weight: a.weight ?? null,
+          encumbrance_penalty: a.encumbrancePenalty ?? a.encumbrance_penalty ?? null,
+          effect: a.effect ?? null,
+          narrative_notes: a.narrativeNotes ?? a.narrative_notes ?? null,
+          rarity: a.rarity ?? null,
+          attunement: a.attunement ?? null,
+          curse: a.curse ?? null,
+
+          // usage / charges
+          usage_type: a.usageType ?? a.usage_type ?? null,
+          max_charges: a.maxCharges ?? a.max_charges ?? null,
+          recharge_window: a.rechargeWindow ?? a.recharge_window ?? null,
+          recharge_notes: a.rechargeNotes ?? a.recharge_notes ?? null,
+
+          // structured hooks
+          effect_hooks: a.effectHooks ?? a.effect_hooks ?? null,
+        }));
+
+        setArmor(mapped);
+
+        // seed local hooks from any effect_hooks that might exist later
+        const initialHooks: Record<string, ItemHook[]> = {};
+        for (const row of mapped) {
+          if (row.effect_hooks && row.effect_hooks.length > 0) {
+            initialHooks[String(row.id)] = row.effect_hooks;
+          }
+        }
+        setHooksByItem(initialHooks);
+        if (mapped.length > 0 && mapped[0]) {
+          setSelectedId(String(mapped[0].id));
+        }
+      } catch (err) {
+        console.error("Error loading armor:", err);
+        alert(
+          `Failed to load armor: ${
+            err instanceof Error ? err.message : "Unknown error"
+          }`
+        );
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    loadArmor();
+  }, []);
+
+  const filteredArmor = useMemo(() => {
+    const q = qtext.trim().toLowerCase();
+    if (!q) return armor;
+    return armor.filter((r) => {
+      const base = [
+        r.name,
+        r.category ?? "",
+        r.area_covered ?? "",
+        r.genre_tags ?? "",
+      ]
+        .join(" ")
+        .toLowerCase();
+      return base.includes(q);
+    });
+  }, [armor, qtext]);
+
+  const selected: ArmorRow | null = useMemo(
+    () =>
+      filteredArmor.find((r) => String(r.id) === String(selectedId ?? "")) ??
+      null,
+    [filteredArmor, selectedId]
+  );
+
+  useEffect(() => {
+    if (!filteredArmor.length) {
+      setSelectedId(null);
+      return;
+    }
+    if (!selected && filteredArmor[0]) {
+      setSelectedId(String(filteredArmor[0].id));
+    }
+  }, [filteredArmor, selected]);
+
+  /* ---------- helpers ---------- */
+
+  function createArmor() {
+    const id = uid();
+    const row: ArmorRow = {
+      id,
+      name: "New Armor",
+      is_free: false,
+      timeline_tag: null,
+      cost_credits: null,
+      area_covered: "",
+      soak: null,
+      category: "light",
+      atype: "mundane",
+      genre_tags: "",
+      weight: null,
+      encumbrance_penalty: null,
+      effect: "",
+      narrative_notes: "",
+      rarity: null,
+      attunement: null,
+      curse: null,
+    };
+    setArmor((prev) => [row, ...prev]);
+    setSelectedId(id);
+  }
+
+  async function deleteSelected() {
+    if (!selected || !currentUser) return;
+    const idStr = String(selected.id);
+
+    const isNew = typeof selected.id === "string" && selected.id.length < 20;
+    const isAdmin = currentUser.role?.toLowerCase() === "admin";
+    const isCreator = selected.createdBy === currentUser.id;
+
+    if (!isNew && !isAdmin && !isCreator) {
+      alert("You can only delete armor you created (admins can delete any).");
+      return;
+    }
+
+    if (!confirm("Delete this armor from the inventory?")) return;
+
+    const removeFromState = () => {
+      setArmor((prev) => prev.filter((r) => String(r.id) !== idStr));
+    };
+
+    if (isNew) {
+      removeFromState();
+      setSelectedId(null);
+      return;
+    }
+
+    try {
+      const res = await fetch(
+        `/api/worldbuilder/inventory/armor/${selected.id}`,
+        { method: "DELETE" }
+      );
+      const data = await res.json();
+      if (!data.ok) {
+        throw new Error(data.error || "Failed to delete armor");
+      }
+      removeFromState();
+      setSelectedId(null);
+      alert("Armor deleted.");
+    } catch (err) {
+      console.error("Error deleting armor:", err);
+      alert(
+        `Failed to delete armor: ${
+          err instanceof Error ? err.message : "Unknown error"
+        }`
+      );
+    }
+  }
+
+  function renameSelected(newName: string) {
+    if (!selected) return;
+    const idStr = String(selected.id);
+    setArmor((prev) =>
+      prev.map((r) => (String(r.id) === idStr ? { ...r, name: newName } : r))
+    );
+  }
+
+  function updateSelected(patch: Partial<ArmorRow>) {
+    if (!selected) return;
+    const idStr = String(selected.id);
+    setArmor((prev) =>
+      prev.map((r) =>
+        String(r.id) === idStr ? ({ ...r, ...patch } as ArmorRow) : r
+      )
+    );
+  }
+
+  async function saveSelected() {
+    if (!selected) return;
+
+    try {
+      const isNew = typeof selected.id === "string" && selected.id.length < 20;
+
+      const payload: any = {
+        name: selected.name,
+        isFree: selected.is_free ?? false,
+        timelineTag: selected.timeline_tag ?? null,
+        costCredits: selected.cost_credits ?? null,
+        areaCovered: selected.area_covered ?? null,
+        soak: selected.soak ?? null,
+        category: selected.category ?? null,
+        atype: selected.atype ?? null,
+        genreTags: selected.genre_tags ?? null,
+        weight: selected.weight ?? null,
+        encumbrancePenalty: selected.encumbrance_penalty ?? null,
+        effect: selected.effect ?? null,
+        narrativeNotes: selected.narrative_notes ?? null,
+        rarity: selected.rarity ?? null,
+        attunement: selected.attunement ?? null,
+        curse: selected.curse ?? null,
+        usageType: selected.usage_type ?? null,
+        maxCharges: selected.max_charges ?? null,
+        rechargeWindow: selected.recharge_window ?? null,
+        rechargeNotes: selected.recharge_notes ?? null,
+        effectHooks: currentHooks.length > 0 ? currentHooks : null,
+      };
+
+      let res;
+      if (isNew) {
+        res = await fetch("/api/worldbuilder/inventory/armor", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+      } else {
+        res = await fetch(
+          `/api/worldbuilder/inventory/armor/${selected.id}`,
+          {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          }
+        );
+      }
+
+      const data = await res.json();
+      if (!data.ok) {
+        throw new Error(data.error || "Failed to save armor");
+      }
+
+      if (isNew) {
+        const oldId = selected.id;
+        const saved = data.armor;
+        if (saved) {
+          const transformed: ArmorRow = {
+            ...saved,
+            is_free: saved.isFree,
+          };
+          setArmor((prev) =>
+            prev.map((r) =>
+              String(r.id) === String(oldId) ? transformed : r
+            )
+          );
+          setSelectedId(String(saved.id));
+        }
+      }
+
+      alert("Armor saved.");
+    } catch (err) {
+      console.error("Error saving armor:", err);
+      alert(
+        `Failed to save armor: ${
+          err instanceof Error ? err.message : "Unknown error"
+        }`
+      );
+    }
+  }
+
+  function appendGenreTag(tag: string) {
+    if (!selected) return;
+    const current = selected.genre_tags ?? "";
+    const bits = current
+      .split(/,/)
+      .map((b) => b.trim())
+      .filter(Boolean);
+    if (bits.includes(tag)) return;
+    const next = [...bits, tag].join(", ");
+    updateSelected({ genre_tags: next });
+  }
+
+  /* ---------- batch upload ---------- */
+
+  function handleParseBatch() {
+    try {
+      if (!batchText.trim()) {
+        setBatchError("No TSV data provided");
+        setBatchPreview([]);
+        return;
+      }
+      const parsed = parseTSVToArmorRecords(batchText);
+      setBatchPreview(parsed);
+      setBatchError(null);
+    } catch (err) {
+      setBatchError(err instanceof Error ? err.message : "Parse error");
+      setBatchPreview([]);
+    }
+  }
+
+  async function handleCommitBatch() {
+    if (!isAdmin) {
+      alert("Admin only");
+      return;
+    }
+    if (batchPreview.length === 0) {
+      alert("No items in preview");
+      return;
+    }
+    if (!confirm(`Upload ${batchPreview.length} armor piece(s)?`)) {
+      return;
+    }
+
+    setBatchUploading(true);
+    try {
+      const updatedArmor = [...armor];
+
+      for (const row of batchPreview) {
+        const name = row.name.trim();
+        if (!name) continue;
+
+        const existingIdx = updatedArmor.findIndex(
+          (i) => i.name.trim().toLowerCase() === name.toLowerCase()
+        );
+
+        const payload = {
+          name: row.name,
+          isFree: row.is_free ?? false,
+          timelineTag: row.timeline_tag,
+          costCredits: row.cost_credits,
+          areaCovered: row.area_covered,
+          soak: row.soak,
+          category: row.category,
+          atype: row.atype,
+          genreTags: row.genre_tags,
+          weight: row.weight,
+          encumbrancePenalty: row.encumbrance_penalty,
+          effect: row.effect,
+          narrativeNotes: row.narrative_notes,
+        };
+
+        let response;
+        if (existingIdx >= 0) {
+          const existing = updatedArmor[existingIdx];
+          if (!existing) continue;
+          response = await fetch(`/api/worldbuilder/inventory/armor/${existing.id}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+        } else {
+          response = await fetch("/api/worldbuilder/inventory/armor", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+        }
+
+        const data = await response.json();
+        if (!data.ok) {
+          throw new Error(
+            data.error || `Failed to save armor "${row.name}"`
+          );
+        }
+
+        if (existingIdx >= 0) {
+          const existing = updatedArmor[existingIdx];
+          if (!existing) continue;
+          updatedArmor[existingIdx] = {
+            ...existing,
+            ...row,
+          };
+        } else if (data.armor) {
+          updatedArmor.unshift({
+            ...row,
+            id: data.armor.id,
+            createdBy: currentUser?.id,
+          });
+        }
+      }
+
+      setArmor(updatedArmor);
+      setBatchText("");
+      setBatchPreview([]);
+      setBatchError(null);
+      alert("Batch upload complete.");
+    } catch (err) {
+      console.error("Batch upload error:", err);
+      alert(
+        `Batch upload failed: ${
+          err instanceof Error ? err.message : "Unknown error"
+        }`
+      );
+    } finally {
+      setBatchUploading(false);
+    }
+  }
+
+  function addHook() {
+    if (!selected) return;
+    const idStr = String(selected.id);
+    const newHook: ItemHook = {
+      id: uid(),
+      trigger: "on_equip",
+      target: "self",
+      kind: "buff",
+      amount: null,
+      label: "",
+    };
+    setHooksByItem((prev) => ({
+      ...prev,
+      [idStr]: [...(prev[idStr] ?? []), newHook],
+    }));
+  }
+
+  function updateHook(hookId: string, patch: Partial<ItemHook>) {
+    if (!selected) return;
+    const idStr = String(selected.id);
+    setHooksByItem((prev) => ({
+      ...prev,
+      [idStr]: (prev[idStr] ?? []).map((h) =>
+        h.id === hookId ? { ...h, ...patch } : h
+      ),
+    }));
+  }
+
+  function removeHook(hookId: string) {
+    if (!selected) return;
+    const idStr = String(selected.id);
+    setHooksByItem((prev) => ({
+      ...prev,
+      [idStr]: (prev[idStr] ?? []).filter((h) => h.id !== hookId),
+    }));
+  }
+
+  const currentHooks = useMemo(() => {
+    if (!selected) return [];
+    return hooksByItem[String(selected.id)] ?? [];
+  }, [selected, hooksByItem]);
+
+  const previewText = useMemo(() => {
+    if (!selected) return "";
+    const a = selected;
+    const lines: string[] = [];
+
+    lines.push(`Armor: ${a.name}`);
+    lines.push(
+      `Timeline: ${nv(a.timeline_tag)}   Cost: ${nv(a.cost_credits)}`
+    );
+    lines.push(
+      `Area Covered: ${nv(a.area_covered)}   Soak: ${nv(a.soak)}`
+    );
+    lines.push(
+      `Category: ${nv(a.category)}   Type: ${nv(a.atype)}   Weight: ${nv(
+        a.weight
+      )}   Encumbrance: ${nv(a.encumbrance_penalty)}`
+    );
+    lines.push(`Tags: ${nv(a.genre_tags)}`);
+
+    // usage summary
+    if (a.usage_type) {
+      lines.push("");
+      let usageLine = "Usage: ";
+      if (a.usage_type === "consumable") {
+        usageLine += "Consumable (one use)";
+      } else if (a.usage_type === "charges") {
+        usageLine += `Charges: ${nv(a.max_charges)} (${nv(
+          a.recharge_window
+        )})`;
+      } else if (a.usage_type === "at_will") {
+        usageLine += "At-will";
+      } else {
+        usageLine += "Custom";
+      }
+      lines.push(usageLine);
+      if (a.recharge_notes) {
+        lines.push(`  Recharge: ${a.recharge_notes}`);
+      }
+    }
+
+    lines.push("");
+    lines.push(`Effect: ${nv(a.effect)}`);
+
+    if (currentHooks.length > 0) {
+      lines.push("");
+      lines.push("System Hooks:");
+      currentHooks.forEach((h, idx) => {
+        let kindPart: string = h.kind;
+        if (h.kind !== "other" && h.amount != null) {
+          kindPart = `${h.kind} ${h.amount}`;
+        }
+        lines.push(
+          `  ${idx + 1}. [${h.trigger} → ${h.target} → ${kindPart}] ${
+            h.label || "(no text)"
+          }`
+        );
+      });
+    }
+
+    if (a.narrative_notes) {
+      lines.push("");
+      lines.push("Notes:");
+      lines.push(a.narrative_notes);
+    }
+
+    return lines.join("\n");
+  }, [selected, currentHooks]);
+
+  /* ---------- render ---------- */
+
+  return (
+    <main className="min-h-screen px-6 py-10">
+      {/* Header */}
+      <header className="max-w-7xl mx-auto mb-8 flex flex-col gap-4">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+          <div>
+            <GradientText
+              as="h1"
+              variant="title"
+              glow
+              className="font-evanescent text-3xl sm:text-4xl tracking-tight"
+            >
+              Armor &amp; Protection Builder
+            </GradientText>
+            <p className="mt-2 text-sm text-zinc-300/90 max-w-2xl">
+              Suits, shields, exoskeletons, environmental gear—anything that
+              soaks, redirects, or ignores harm. This window shapes how hard
+              your worlds hit and how long heroes survive.
+            </p>
+          </div>
+          <div className="flex gap-3 justify-end">
+            <Link href="/worldbuilder/toolbox">
+              <Button variant="secondary" size="sm" type="button">
+                ← Toolbox
+              </Button>
+            </Link>
+          </div>
+        </div>
+
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+          <WBNav current="inventory" />
+          <InventoryNav />
+        </div>
+      </header>
+
+      {/* Quick help */}
+      <section className="max-w-7xl mx-auto mb-4">
+        <Card className="bg-white/5 border border-white/10 rounded-3xl p-4 shadow-lg">
+          <h2 className="text-sm font-semibold text-zinc-200 mb-1">
+            How this window works
+          </h2>
+          <ol className="list-decimal pl-5 text-xs text-zinc-300 space-y-1">
+            <li>
+              Use the library on the left to search and select armor pieces.
+            </li>
+            <li>
+              Edit coverage, soak, weight, and encumbrance in the center
+              editor.
+            </li>
+            <li>
+              Use the preview on the right as the text block for sheets and
+              statblocks.
+            </li>
+          </ol>
+        </Card>
+      </section>
+
+      {/* Main layout */}
+      <section className="max-w-7xl mx-auto grid grid-cols-1 xl:grid-cols-[320px,1.4fr,1.1fr] gap-6">
+        {/* LEFT: library */}
+        <Card
+          padded={false}
+          className="rounded-3xl border border-white/10 bg-white/5 backdrop-blur p-4 shadow-2xl flex flex-col gap-4"
+        >
+          <div className="flex items-center justify-between gap-2">
+            <h2 className="text-sm font-semibold text-zinc-200">
+              Armor Library
+            </h2>
+            <Button
+              variant="primary"
+              size="sm"
+              type="button"
+              onClick={createArmor}
+            >
+              + New Armor
+            </Button>
+          </div>
+
+          <Input
+            value={qtext}
+            onChange={(e) => setQtext(e.target.value)}
+            placeholder="Search armor by name, area, or tags…"
+          />
+
+          <div className="mt-2 flex-1 min-h-0 overflow-hidden rounded-2xl border border-white/10 bg-black/30">
+            <div className="flex items-center justify-between px-3 py-2 text-xs text-zinc-400 border-b border-white/10">
+              <span>Armor pieces: {filteredArmor.length}</span>
+              <span className="uppercase tracking-wide text-[10px] text-zinc-500">
+                Library
+              </span>
+            </div>
+
+            <div className="max-h-[420px] overflow-auto">
+              {loading ? (
+                <div className="px-3 py-6 text-center text-xs text-zinc-500">
+                  Loading armor…
+                </div>
+              ) : filteredArmor.length === 0 ? (
+                <div className="px-3 py-6 text-center text-xs text-zinc-500">
+                  No armor yet. Create your first piece.
+                </div>
+              ) : (
+                <table className="w-full text-xs">
+                  <thead className="text-left text-zinc-400">
+                    <tr>
+                      <th className="px-3 py-1">Name</th>
+                      <th className="px-3 py-1">Area</th>
+                      <th className="px-3 py-1">Soak</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filteredArmor.map((r) => {
+                      const idStr = String(r.id);
+                      const isSel = selectedId === idStr;
+                      return (
+                        <tr
+                          key={idStr}
+                          className={`border-t border-white/5 cursor-pointer hover:bg-white/5 ${
+                            isSel ? "bg-white/10" : ""
+                          }`}
+                          onClick={() => setSelectedId(idStr)}
+                        >
+                          <td className="px-3 py-1.5">
+                            {r.name || "(unnamed)"}
+                          </td>
+                          <td className="px-3 py-1.5">
+                            {nv(r.area_covered ?? "")}
+                          </td>
+                          <td className="px-3 py-1.5">
+                            {nv(r.soak ?? "")}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              )}
+            </div>
+
+            <div className="flex items-center justify-between px-3 py-2 text-xs text-zinc-400 border-t border-white/10">
+              <div className="flex items-center gap-2">
+                <span>Rename:</span>
+                <input
+                  className="rounded-md border border-white/15 bg-black/50 px-2 py-1 text-xs text-zinc-100 outline-none"
+                  disabled={!selected}
+                  value={selected?.name ?? ""}
+                  onChange={(e) => renameSelected(e.target.value)}
+                />
+              </div>
+              <Button
+                variant="secondary"
+                size="sm"
+                type="button"
+                disabled={
+                  !selected ||
+                  !currentUser ||
+                  (currentUser.role?.toLowerCase() !== "admin" &&
+                    selected?.createdBy !== currentUser.id)
+                }
+                onClick={deleteSelected}
+              >
+                Delete
+              </Button>
+            </div>
+          </div>
+        </Card>
+
+        {/* Admin: Batch Upload */}
+        {isAdmin && (
+          <Card
+            padded={false}
+            className="rounded-3xl border border-amber-300/40 bg-amber-300/5 backdrop-blur p-4 shadow-2xl"
+          >
+            <div className="flex items-center justify-between mb-3">
+              <div className="text-xs font-semibold text-amber-100">
+                Admin · Batch Upload
+              </div>
+              <div className="flex gap-2">
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  type="button"
+                  onClick={handleParseBatch}
+                  disabled={!batchText.trim()}
+                >
+                  Parse preview
+                </Button>
+                <Button
+                  variant="primary"
+                  size="sm"
+                  type="button"
+                  onClick={handleCommitBatch}
+                  disabled={batchPreview.length === 0 || batchUploading}
+                >
+                  {batchUploading ? "Uploading..." : "Commit to DB"}
+                </Button>
+              </div>
+            </div>
+
+            <textarea
+              className="w-full h-32 rounded-lg border border-amber-300/30 bg-black/40 px-3 py-2 text-xs text-zinc-100 font-mono resize-y"
+              placeholder="Armor Name	Timeline Tag	Cost (Credits)	Area Covered	Soak	Category	Type	Genre Tags	Weight	Encomberence Penalty	Effect	Narrative/Variant Notes"
+              value={batchText}
+              onChange={(e) => setBatchText(e.target.value)}
+            />
+
+            {batchError && (
+              <p className="mt-2 text-xs text-rose-300">{batchError}</p>
+            )}
+            {batchPreview.length > 0 && (
+              <div className="mt-2 text-xs text-amber-200">
+                Parsed {batchPreview.length} armor piece(s). Click "Commit to DB" to
+                upload.
+              </div>
+            )}
+          </Card>
+        )}
+
+        {/* MIDDLE: editor */}
+        <Card
+          padded={false}
+          className="rounded-3xl border border-white/10 bg-white/5 backdrop-blur p-5 shadow-2xl"
+        >
+          {selected ? (
+            <div className="space-y-4">
+              {/* name + save + flags */}
+              <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-3">
+                <div className="flex-1 space-y-2">
+                  <FormField
+                    label="Armor Name"
+                    htmlFor="armor-name"
+                    description="Label for sheets and statblocks."
+                  >
+                    <Input
+                      id="armor-name"
+                      value={selected.name}
+                      onChange={(e) =>
+                        updateSelected({ name: e.target.value })
+                      }
+                    />
+                  </FormField>
+
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={selected.is_free ?? false}
+                      onChange={(e) =>
+                        updateSelected({ is_free: e.target.checked })
+                      }
+                      className="w-4 h-4 rounded border-white/20 bg-black/30 text-violet-500 focus:ring-violet-500/50"
+                    />
+                    <span className="text-xs text-zinc-300">
+                      Free (available to all users)
+                    </span>
+                  </label>
+                </div>
+                <div className="shrink-0 flex items-end">
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    type="button"
+                    onClick={saveSelected}
+                  >
+                    Save Armor
+                  </Button>
+                </div>
+              </div>
+
+              {/* coverage & soak */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <FormField
+                  label="Area Covered"
+                  htmlFor="armor-area"
+                  description="Chest, full-body, head, arms, etc."
+                >
+                  <Input
+                    id="armor-area"
+                    value={selected.area_covered ?? ""}
+                    onChange={(e) =>
+                      updateSelected({
+                        area_covered: e.target.value,
+                      })
+                    }
+                  />
+                </FormField>
+                <FormField
+                  label="Soak"
+                  htmlFor="armor-soak"
+                  description="Numeric soak / reduction value."
+                >
+                  <Input
+                    id="armor-soak"
+                    type="number"
+                    value={selected.soak ?? ""}
+                    onChange={(e) =>
+                      updateSelected({
+                        soak:
+                          e.target.value === ""
+                            ? null
+                            : Number(e.target.value),
+                      })
+                    }
+                  />
+                </FormField>
+              </div>
+
+              {/* category & type */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <FormField
+                  label="Category"
+                  htmlFor="armor-category"
+                  description="Used by proficiency and load rules."
+                >
+                  <select
+                    id="armor-category"
+                    className="w-full rounded-lg border border-white/10 bg-neutral-950/50 px-3 py-2 text-sm text-zinc-100"
+                    value={selected.category ?? ""}
+                    onChange={(e) =>
+                      updateSelected({
+                        category: e.target.value || null,
+                      })
+                    }
+                  >
+                    <option value="">(unset)</option>
+                    <option value="light">Light</option>
+                    <option value="medium">Medium</option>
+                    <option value="heavy">Heavy</option>
+                    <option value="shield">Shield</option>
+                    <option value="environmental">Environmental</option>
+                    <option value="exoskeleton">Exoskeleton</option>
+                    <option value="other">Other</option>
+                  </select>
+                </FormField>
+
+                <FormField
+                  label="Armor Type"
+                  htmlFor="armor-type"
+                  description="Mundane, magic, artifact, tech, etc."
+                >
+                  <select
+                    id="armor-type"
+                    className="w-full rounded-lg border border-white/10 bg-neutral-950/50 px-3 py-2 text-sm text-zinc-100"
+                    value={selected.atype ?? ""}
+                    onChange={(e) =>
+                      updateSelected({
+                        atype: e.target.value || null,
+                      })
+                    }
+                  >
+                    <option value="">(unset)</option>
+                    <option value="natural">Natural</option>
+                    <option value="mundane">Mundane</option>
+                    <option value="magic">Magic</option>
+                    <option value="artifact">Artifact</option>
+                    <option value="tech">Tech</option>
+                    <option value="other">Other</option>
+                  </select>
+                </FormField>
+              </div>
+
+              {/* durability / cost */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <FormField label="Durability" htmlFor="armor-durability" description="Armor condition/health points">
+                  <Input
+                    id="armor-durability"
+                    type="number"
+                    value={selected.durability ?? ""}
+                    onChange={(e) =>
+                      updateSelected({
+                        durability:
+                          e.target.value === ""
+                            ? null
+                            : Number(e.target.value),
+                      })
+                    }
+                  />
+                </FormField>
+                <FormField label="Cost (Credits)" htmlFor="armor-cost">
+                  <Input
+                    id="armor-cost"
+                    type="number"
+                    value={selected.cost_credits ?? ""}
+                    onChange={(e) =>
+                      updateSelected({
+                        cost_credits:
+                          e.target.value === ""
+                            ? null
+                            : Number(e.target.value),
+                      })
+                    }
+                  />
+                </FormField>
+              </div>
+
+              {/* weight & encumbrance */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <FormField label="Weight" htmlFor="armor-weight">
+                  <Input
+                    id="armor-weight"
+                    type="number"
+                    value={selected.weight ?? ""}
+                    onChange={(e) =>
+                      updateSelected({
+                        weight:
+                          e.target.value === ""
+                            ? null
+                            : Number(e.target.value),
+                      })
+                    }
+                  />
+                </FormField>
+                <FormField
+                  label="Encumbrance Penalty"
+                  htmlFor="armor-enc"
+                  description="Penalty applied to checks or movement."
+                >
+                  <Input
+                    id="armor-enc"
+                    type="number"
+                    value={selected.encumbrance_penalty ?? ""}
+                    onChange={(e) =>
+                      updateSelected({
+                        encumbrance_penalty:
+                          e.target.value === ""
+                            ? null
+                            : Number(e.target.value),
+                      })
+                    }
+                  />
+                </FormField>
+              </div>
+
+              {/* tags */}
+              <FormField
+                label="Genre Tags"
+                htmlFor="armor-tags"
+                description="Comma- or space-separated; use chips to append."
+              >
+                <div className="space-y-2">
+                  <Input
+                    id="armor-tags"
+                    value={selected.genre_tags ?? ""}
+                    onChange={(e) =>
+                      updateSelected({
+                        genre_tags: e.target.value,
+                      })
+                    }
+                  />
+                  <div className="flex flex-wrap gap-1.5">
+                    {GENRE_PRESETS.map((tag) => (
+                      <button
+                        key={tag}
+                        type="button"
+                        onClick={() => appendGenreTag(tag)}
+                        className="rounded-full border border-violet-400/40 bg-violet-500/10 px-2 py-0.5 text-[11px] text-violet-100 hover:bg-violet-500/20 transition"
+                      >
+                        + {tag}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </FormField>
+
+              {/* usage / charges */}
+              <FormField
+                label="Usage / Charges"
+                htmlFor="armor-usage"
+                description="Is this a one-use consumable, a charged item, or something you can use freely?"
+              >
+                <div className="space-y-2">
+                  <div className="grid gap-2 sm:grid-cols-3">
+                    {/* usage type */}
+                    <select
+                      className="rounded-lg border border-white/10 bg-black/40 px-2 py-1 text-xs text-zinc-100"
+                      value={selected.usage_type ?? "at_will"}
+                      onChange={(e) =>
+                        updateSelected({
+                          usage_type: e.target.value as UsageType,
+                        })
+                      }
+                    >
+                      <option value="at_will">At-will (armor default)</option>
+                      <option value="consumable">Consumable (one use)</option>
+                      <option value="charges">Has charges</option>
+                      <option value="other">Other / custom</option>
+                    </select>
+
+                    {/* max charges (only for 'charges') */}
+                    {selected.usage_type === "charges" && (
+                      <Input
+                        type="number"
+                        min={0}
+                        placeholder="Max charges"
+                        value={selected.max_charges ?? ""}
+                        onChange={(e) =>
+                          updateSelected({
+                            max_charges:
+                              e.target.value === ""
+                                ? null
+                                : Number(e.target.value),
+                          })
+                        }
+                      />
+                    )}
+
+                    {/* recharge window (only for 'charges') */}
+                    {selected.usage_type === "charges" && (
+                      <select
+                        className="rounded-lg border border-white/10 bg-black/40 px-2 py-1 text-xs text-zinc-100"
+                        value={selected.recharge_window ?? "none"}
+                        onChange={(e) =>
+                          updateSelected({
+                            recharge_window: e.target.value as RechargeWindow,
+                          })
+                        }
+                      >
+                        <option value="none">Does not recharge</option>
+                        <option value="scene">Per scene</option>
+                        <option value="session">Per session</option>
+                        <option value="rest">Per rest</option>
+                        <option value="day">Per day</option>
+                        <option value="custom">Custom</option>
+                      </select>
+                    )}
+                  </div>
+
+                  {/* recharge notes, if custom */}
+                  {selected.usage_type === "charges" &&
+                    selected.recharge_window === "custom" && (
+                      <textarea
+                        className="w-full rounded-lg border border-white/10 bg-neutral-950/50 px-3 py-2 text-xs text-zinc-100"
+                        placeholder='Describe how this recharges (e.g. "regains 1 charge for every 10 Mana spent").'
+                        value={selected.recharge_notes ?? ""}
+                        onChange={(e) =>
+                          updateSelected({
+                            recharge_notes: e.target.value,
+                          })
+                        }
+                      />
+                    )}
+                </div>
+              </FormField>
+
+              {/* effect & notes */}
+              <FormField
+                label="Mechanical Effect"
+                htmlFor="armor-effect"
+                description="How this armor interacts with attacks, damage types, and conditions."
+              >
+                <textarea
+                  id="armor-effect"
+                  className="w-full min-h-[120px] rounded-lg border border-white/10 bg-neutral-950/50 px-3 py-2 text-sm text-zinc-100"
+                  value={selected.effect ?? ""}
+                  onChange={(e) =>
+                    updateSelected({
+                      effect: e.target.value,
+                    })
+                  }
+                />
+              </FormField>
+
+              {/* system hooks */}
+              <FormField
+                label="System Hooks"
+                htmlFor="armor-hooks"
+                description="Structured effects for future automation: on_equip buffs, passive auras, etc."
+              >
+                <div className="space-y-2">
+                  {currentHooks.map((hook) => (
+                    <div
+                      key={hook.id}
+                      className="rounded-2xl border border-emerald-400/30 bg-emerald-500/5 px-3 py-2 flex flex-col gap-2"
+                    >
+                      <div className="flex flex-wrap gap-2">
+                        {/* trigger */}
+                        <select
+                          className="rounded-lg border border-emerald-400/40 bg-black/30 px-2 py-1 text-[11px] text-emerald-50"
+                          value={hook.trigger}
+                          onChange={(e) =>
+                            updateHook(hook.id, {
+                              trigger: e.target.value as ItemHookTrigger,
+                            })
+                          }
+                        >
+                          <option value="on_use">on_use</option>
+                          <option value="on_equip">on_equip</option>
+                          <option value="passive">passive</option>
+                          <option value="other">other</option>
+                        </select>
+
+                        {/* target */}
+                        <select
+                          className="rounded-lg border border-emerald-400/40 bg-black/30 px-2 py-1 text-[11px] text-emerald-50"
+                          value={hook.target}
+                          onChange={(e) =>
+                            updateHook(hook.id, {
+                              target: e.target.value as ItemHookTarget,
+                            })
+                          }
+                        >
+                          <option value="self">self</option>
+                          <option value="ally">ally</option>
+                          <option value="enemy">enemy</option>
+                          <option value="area">area</option>
+                          <option value="other">other</option>
+                        </select>
+
+                        {/* kind */}
+                        <select
+                          className="rounded-lg border border-emerald-400/40 bg-black/30 px-2 py-1 text-[11px] text-emerald-50"
+                          value={hook.kind}
+                          onChange={(e) =>
+                            updateHook(hook.id, {
+                              kind: e.target.value as ItemHookKind,
+                            })
+                          }
+                        >
+                          <option value="heal">heal</option>
+                          <option value="damage">damage</option>
+                          <option value="buff">buff</option>
+                          <option value="debuff">debuff</option>
+                          <option value="utility">utility</option>
+                          <option value="other">other</option>
+                        </select>
+
+                        {/* amount (optional) */}
+                        <Input
+                          type="number"
+                          className="w-20 text-[11px]"
+                          placeholder="amt"
+                          value={hook.amount ?? ""}
+                          onChange={(e) =>
+                            updateHook(hook.id, {
+                              amount:
+                                e.target.value === ""
+                                  ? null
+                                  : Number(e.target.value),
+                            })
+                          }
+                        />
+                      </div>
+
+                      {/* label / description */}
+                      <Input
+                        className="w-full text-[11px]"
+                        placeholder='e.g. "+2 to Armor Class" or "Aura: enemies within 10ft take 1 damage/round"'
+                        value={hook.label}
+                        onChange={(e) =>
+                          updateHook(hook.id, { label: e.target.value })
+                        }
+                      />
+
+                      <div className="flex justify-end">
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          className="text-[11px] text-emerald-200/80 hover:text-emerald-50"
+                          onClick={() => removeHook(hook.id)}
+                        >
+                          Remove
+                        </Button>
+                      </div>
+                    </div>
+                  ))}
+
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    size="sm"
+                    onClick={addHook}
+                  >
+                    + Add Hook
+                  </Button>
+                </div>
+              </FormField>
+
+              <FormField
+                label="Narrative Notes"
+                htmlFor="armor-notes"
+                description="How it looks, sounds, and feels; who forges or wears it."
+              >
+                <textarea
+                  id="armor-notes"
+                  className="w-full min-h-[120px] rounded-lg border border-white/10 bg-neutral-950/50 px-3 py-2 text-sm text-zinc-100"
+                  value={selected.narrative_notes ?? ""}
+                  onChange={(e) =>
+                    updateSelected({
+                      narrative_notes: e.target.value,
+                    })
+                  }
+                />
+              </FormField>
+
+              {/* Legendary Properties */}
+              <FormField
+                label="Rarity"
+                htmlFor="armor-rarity"
+                description="Item rarity tier (common to mythic)."
+              >
+                <select
+                  id="armor-rarity"
+                  className="w-full rounded-lg border border-white/10 bg-neutral-950/50 px-3 py-2 text-sm text-zinc-100"
+                  value={selected.rarity ?? ""}
+                  onChange={(e) =>
+                    updateSelected({
+                      rarity: e.target.value || null,
+                    })
+                  }
+                >
+                  <option value="">None</option>
+                  <option value="common">Common</option>
+                  <option value="uncommon">Uncommon</option>
+                  <option value="rare">Rare</option>
+                  <option value="epic">Epic</option>
+                  <option value="legendary">Legendary</option>
+                  <option value="mythic">Mythic</option>
+                </select>
+              </FormField>
+
+              <FormField
+                label="Attunement"
+                htmlFor="armor-attunement"
+                description="Requirements to attune or use this item."
+              >
+                <Input
+                  id="armor-attunement"
+                  type="text"
+                  value={selected.attunement ?? ""}
+                  onChange={(e) =>
+                    updateSelected({
+                      attunement: e.target.value || null,
+                    })
+                  }
+                />
+              </FormField>
+
+              <FormField
+                label="Curse"
+                htmlFor="armor-curse"
+                description="Drawbacks, corruption, oaths, or other negative effects."
+              >
+                <textarea
+                  id="armor-curse"
+                  className="w-full min-h-[80px] rounded-lg border border-white/10 bg-neutral-950/50 px-3 py-2 text-sm text-zinc-100"
+                  value={selected.curse ?? ""}
+                  onChange={(e) =>
+                    updateSelected({
+                      curse: e.target.value || null,
+                    })
+                  }
+                />
+              </FormField>
+            </div>
+          ) : (
+            <p className="text-sm text-zinc-400">
+              No armor selected. Create or select one from the library.
+            </p>
+          )}
+        </Card>
+
+        {/* RIGHT: preview */}
+        <Card className="rounded-3xl border border-white/10 bg-white/5 backdrop-blur p-4 shadow-xl">
+          <FormField
+            label="Armor Preview"
+            htmlFor="armor-preview"
+            description="Copy-paste ready block for sheets, statblocks, and modules."
+          >
+            <textarea
+              id="armor-preview"
+              readOnly
+              className="w-full h-[320px] rounded-lg border border-white/10 bg-neutral-950/70 px-3 py-2 text-xs text-zinc-200 font-mono"
+              value={previewText}
+            />
+          </FormField>
+        </Card>
+      </section>
+    </main>
+  );
+}

@@ -1,0 +1,2981 @@
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
+
+import { GradientText } from "@/components/GradientText";
+import { Card } from "@/components/Card";
+import { Button } from "@/components/Button";
+import { FormField } from "@/components/FormField";
+import { Input } from "@/components/Input";
+import { Tabs } from "@/components/Tabs";
+import { WBNav } from "@/components/worldbuilder/WBNav";
+import { buildRaceHierarchyMetaMap } from "@/lib/raceHierarchy";
+
+/* ---------- Types (mirroring your old logic) ---------- */
+
+type TabKey = "identity" | "attributes" | "bonuses" | "preview";
+
+type RaceDefinition = {
+  legacy_description?: string | null;
+  physical_characteristics?: string | null;
+  physical_description?: string | null;
+  racial_quirk?: string | null;
+  quirk_success_effect?: string | null;
+  quirk_failure_effect?: string | null;
+  common_languages_known?: string | null;
+  common_archetypes?: string | null;
+  examples_by_genre?: string | null;
+  cultural_mindset?: string | null;
+  outlook_on_magic?: string | null;
+};
+
+type RaceAttributes = {
+  age_range?: string | null;
+  size?: string | null;
+  strength_max?: string | null;
+  dexterity_max?: string | null;
+  constitution_max?: string | null;
+  intelligence_max?: string | null;
+  wisdom_max?: string | null;
+  charisma_max?: string | null;
+  base_magic?: string | null;
+  base_movement?: string | null;
+};
+
+type BonusRow = {
+  slotIdx: number;
+  skillName: string;
+  points: string;
+};
+
+type GalaxyWorldSummary = {
+  id: string;
+  name: string;
+  canEdit?: boolean;
+};
+
+type WorldScope = "__all__" | "__unassigned__" | string;
+type ParentScope = "all" | "with-parent" | "top-level";
+type OwnershipScope = "all" | "mine" | "editable" | "readonly";
+type SortKey = "tree" | "name" | "classification" | "created" | "updated";
+type SortDirection = "asc" | "desc";
+
+type RaceRecord = {
+  id: string | number;
+  worldId?: string | null;
+  worldName?: string | null;
+  parentRaceId?: string | null;
+  parent2RaceId?: string | null;
+  name: string;
+  tagline: string;
+  is_free?: boolean;
+  createdBy?: string;
+  canEdit?: boolean; // Add canEdit flag from API
+  classifications: string[];
+  lineageDepth?: number;
+  lineagePath?: string[];
+  hasLineageCycle?: boolean;
+  def: RaceDefinition;
+  attr: RaceAttributes;
+  bonusRows: BonusRow[];
+  specialRows: BonusRow[];
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+/* ---------- Constants ---------- */
+
+const TAB_SECTIONS: { id: TabKey; label: string }[] = [
+  { id: "identity", label: "Identity & Lore" },
+  { id: "attributes", label: "Attributes" },
+  { id: "bonuses", label: "Bonuses" },
+  { id: "preview", label: "Preview" },
+];
+
+const SIZE_OPTIONS = [
+  "tiny",
+  "small",
+  "average",
+  "large",
+  "gigantic",
+  "titan",
+] as const;
+
+const MAX_BONUS_SKILLS = 7;
+const MAX_SPECIALS = 5;
+
+function makeBonusRows(count: number): BonusRow[] {
+  return Array.from({ length: count }, (_, i) => ({
+    slotIdx: i,
+    skillName: "",
+    points: "0",
+  }));
+}
+
+const uid = () => Math.random().toString(36).slice(2, 10);
+
+function normalizeRaceParentId(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function normalizeClassifications(value: unknown): string[] {
+  const source = Array.isArray(value) ? value : [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const entry of source) {
+    if (typeof entry !== "string") continue;
+    const label = entry.trim();
+    if (!label) continue;
+    const key = label.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(label);
+  }
+  return out;
+}
+
+function normalizeClassificationRows(value: unknown): string[] {
+  const source = Array.isArray(value) ? value : [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const entry of source) {
+    const label = typeof entry === "string" ? entry.trim() : "";
+    if (!label) {
+      out.push("");
+      continue;
+    }
+    const key = label.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(label);
+  }
+  return out;
+}
+
+function resolveRaceClassifications(
+  race: { classifications?: unknown; masterRaceLabel?: unknown; masterLabel?: unknown } | null | undefined,
+  fallback: string[] = []
+): string[] {
+  const hasClassificationsField =
+    Boolean(race) &&
+    Object.prototype.hasOwnProperty.call(
+      race as { classifications?: unknown },
+      "classifications"
+    );
+  if (hasClassificationsField) {
+    return normalizeClassifications(race?.classifications);
+  }
+  const fromLegacyLabels = normalizeClassifications([
+    race?.masterRaceLabel,
+    race?.masterLabel,
+  ]);
+  if (fromLegacyLabels.length > 0) return fromLegacyLabels;
+  return normalizeClassifications(fallback);
+}
+
+function getRaceParentIds(race: {
+  parentRaceId?: string | null;
+  parent2RaceId?: string | null;
+}): string[] {
+  const parentIds: string[] = [];
+  const seen = new Set<string>();
+  for (const value of [race.parentRaceId, race.parent2RaceId]) {
+    const parentId = normalizeRaceParentId(value);
+    if (!parentId || seen.has(parentId)) continue;
+    seen.add(parentId);
+    parentIds.push(parentId);
+  }
+  return parentIds;
+}
+
+function isUuidLike(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    value
+  );
+}
+
+function sortRacesAsTree(races: RaceRecord[]): RaceRecord[] {
+  const byId = new Map<string, RaceRecord>();
+  const childrenByParentId = new Map<string, RaceRecord[]>();
+  const roots: RaceRecord[] = [];
+
+  for (const race of races) {
+    byId.set(String(race.id), race);
+  }
+
+  for (const race of races) {
+    const id = String(race.id);
+    const parentId = getRaceParentIds(race)[0] ?? null;
+    if (parentId && parentId !== id && byId.has(parentId)) {
+      const list = childrenByParentId.get(parentId) ?? [];
+      list.push(race);
+      childrenByParentId.set(parentId, list);
+      continue;
+    }
+    roots.push(race);
+  }
+
+  const byName = (a: RaceRecord, b: RaceRecord) =>
+    (a.name || "").localeCompare(b.name || "");
+
+  roots.sort(byName);
+  for (const [parentId, children] of childrenByParentId.entries()) {
+    children.sort(byName);
+    childrenByParentId.set(parentId, children);
+  }
+
+  const ordered: RaceRecord[] = [];
+  const visited = new Set<string>();
+
+  const walk = (node: RaceRecord) => {
+    const id = String(node.id);
+    if (visited.has(id)) return;
+    visited.add(id);
+    ordered.push(node);
+    const children = childrenByParentId.get(id) ?? [];
+    for (const child of children) {
+      walk(child);
+    }
+  };
+
+  for (const root of roots) {
+    walk(root);
+  }
+
+  const leftovers = races
+    .filter((race) => !visited.has(String(race.id)))
+    .sort(byName);
+
+  for (const race of leftovers) {
+    walk(race);
+  }
+
+  return ordered;
+}
+
+/* ---------- Batch parsing helpers ---------- */
+
+function normalizeHeader(h: string): string {
+  return h.trim().toLowerCase();
+}
+
+function parseBonusList(raw: string, max: number): BonusRow[] {
+  const out: BonusRow[] = [];
+  if (!raw) return makeBonusRows(max);
+  const txt = raw.trim();
+  if (!txt || /^none$/i.test(txt)) return makeBonusRows(max);
+
+  const parts = txt.split(",").map((p) => p.trim()).filter(Boolean);
+
+  for (const part of parts) {
+    if (out.length >= max) break;
+    // e.g. "Survival +4" or "Research & Analysis +2"
+    const m = part.match(/^(.*?)(?:\s*\+(-?\d+))?$/);
+    if (!m || !m[1]) continue;
+    const skillName = m[1].trim();
+    const points = m[2] ? m[2] : "0";
+    if (!skillName) continue;
+    out.push({
+      slotIdx: out.length,
+      skillName,
+      points,
+    });
+  }
+
+  while (out.length < max) {
+    out.push({
+      slotIdx: out.length,
+      skillName: "",
+      points: "0",
+    });
+  }
+
+  return out;
+}
+
+function normalizeSize(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const v = value.trim().toLowerCase();
+  if (!v) return null;
+  if (v === "medium" || v === "average") return "average";
+  if (["tiny", "small", "large", "gigantic", "titan"].includes(v)) return v;
+  // Fallback: keep original
+  return value;
+}
+
+function parseTSVToRaceRecords(raw: string): RaceRecord[] {
+  const trimmed = raw.trim();
+  if (!trimmed) return [];
+  const lines = trimmed.split(/\r?\n/).filter((l) => l.trim().length > 0);
+  if (lines.length < 2) {
+    throw new Error("Need a header row plus at least one data row.");
+  }
+
+  const headerCells = (lines[0] ?? "").split("\t").map((h) => h.trim());
+  const headersNorm = headerCells.map(normalizeHeader);
+
+  const findIndex = (...candidates: string[]) => {
+    for (const c of candidates) {
+      const norm = c.toLowerCase();
+      const i = headersNorm.findIndex((h) => h === norm);
+      if (i !== -1) return i;
+    }
+    return -1;
+  };
+
+  const records: RaceRecord[] = [];
+
+  for (let li = 1; li < lines.length; li++) {
+    const cols = (lines[li] ?? "").split("\t");
+
+    const get = (...names: string[]): string => {
+      const idx = findIndex(...names);
+      if (idx === -1) return "";
+      return (cols[idx] ?? "").trim();
+    };
+
+    const name = get("Creature", "Race", "Name");
+    if (!name) continue; // skip blank row
+
+    const legacy = get("Legacy Description");
+    const physChars = get("Physical Characteristics");
+    const physDesc = get("Physicial Description", "Physical Description");
+    const ageRange = get("Age Range");
+    const sizeRaw = get("Size");
+    const strMax = get("Strenght Max", "Strength Max");
+    const dexMax = get("Dexterity Max");
+    const conMax = get("Constitution Max");
+    const intMax = get("Intelligence Max");
+    const wisMax = get("Wisdom Max");
+    const chaMax = get("Charisma Max");
+    const baseMagic = get("Base Magic");
+    const baseMove = get("Base Movement");
+    const racialQuirk = get("Racial Quirk");
+    const quirkSuccess = get("Quirk Success Effect");
+    const quirkFailure = get("Quirk Failure Effect");
+    const skillBonusStr = get("Skill Bonuses");
+    const racialSpecialStr = get("Creature Special Abilities", "Racial Special Abilities");
+    const langs = get("Common Languages Known");
+    const archetypes = get("Common Archtypes", "Common Archetypes");
+    const examples = get("Examples of Use in Different Genres");
+    const mindset = get("Cultural Mindset");
+    const outlook = get("Outlook On Magic", "Outlook on Magic");
+
+    const bonusRows = parseBonusList(skillBonusStr, MAX_BONUS_SKILLS);
+    const specialRows = parseBonusList(racialSpecialStr, MAX_SPECIALS);
+
+    const rec: RaceRecord = {
+      id: uid(),
+      name,
+      tagline: "", // can be filled manually later if desired
+      is_free: false,
+      classifications: [],
+      def: {
+        legacy_description: legacy || null,
+        physical_characteristics: physChars || null,
+        physical_description: physDesc || null,
+        racial_quirk: racialQuirk || null,
+        quirk_success_effect: quirkSuccess || null,
+        quirk_failure_effect: quirkFailure || null,
+        common_languages_known: langs || null,
+        common_archetypes: archetypes || null,
+        examples_by_genre: examples || null,
+        cultural_mindset: mindset || null,
+        outlook_on_magic: outlook || null,
+      },
+      attr: {
+        age_range: ageRange || null,
+        size: normalizeSize(sizeRaw),
+        strength_max: strMax || null,
+        dexterity_max: dexMax || null,
+        constitution_max: conMax || null,
+        intelligence_max: intMax || null,
+        wisdom_max: wisMax || null,
+        charisma_max: chaMax || null,
+        base_magic: baseMagic || null,
+        base_movement: baseMove || null,
+      },
+      bonusRows,
+      specialRows,
+    };
+
+    records.push(rec);
+  }
+
+  return records;
+}
+
+function mapApiRaceToRecord(r: any): RaceRecord {
+  return {
+    id: r.id,
+    worldId: r.worldId ?? null,
+    worldName: r.worldName ?? null,
+    parentRaceId: r.parentRaceId ?? null,
+    parent2RaceId: r.parent2RaceId ?? null,
+    name: r.name,
+    tagline: r.tagline || "",
+    is_free: r.isFree ?? false,
+    createdBy: r.createdBy,
+    canEdit: r.canEdit ?? true,
+    classifications: resolveRaceClassifications(r),
+    lineageDepth: typeof r.lineageDepth === "number" ? r.lineageDepth : 0,
+    lineagePath: Array.isArray(r.lineagePath)
+      ? r.lineagePath
+      : [r.name || "Unnamed Creature"],
+    hasLineageCycle: Boolean(r.hasLineageCycle),
+    def: r.definition || {},
+    attr: r.attributes || {},
+    bonusRows: [
+      ...(r.bonusSkills || []).map((b: any, idx: number) => ({
+        slotIdx: idx,
+        skillName: b.skillName || "",
+        points: String(b.points || 0),
+      })),
+      ...makeBonusRows(MAX_BONUS_SKILLS - (r.bonusSkills || []).length),
+    ].map((row, idx) => ({ ...row, slotIdx: idx })),
+    specialRows: [
+      ...(r.specialAbilities || []).map((s: any, idx: number) => ({
+        slotIdx: idx,
+        skillName: s.skillName || "",
+        points: String(s.points || 0),
+      })),
+      ...makeBonusRows(MAX_SPECIALS - (r.specialAbilities || []).length),
+    ].map((row, idx) => ({ ...row, slotIdx: idx })),
+    createdAt: typeof r.createdAt === "string" ? r.createdAt : undefined,
+    updatedAt: typeof r.updatedAt === "string" ? r.updatedAt : undefined,
+  };
+}
+
+/* ---------- Page ---------- */
+
+export default function CreaturesPage() {
+  const [activeTab, setActiveTab] = useState<TabKey>("identity");
+
+  // User session
+  const [currentUser, setCurrentUser] = useState<{ id: string; role: string } | null>(null);
+  const isAdmin = currentUser?.role?.toLowerCase() === "admin";
+
+  // Library of races
+  const [races, setRaces] = useState<RaceRecord[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [qtext, setQtext] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [worlds, setWorlds] = useState<GalaxyWorldSummary[]>([]);
+  const [worldScope, setWorldScope] = useState<WorldScope>("__all__");
+  const [parentScope, setParentScope] = useState<ParentScope>("all");
+  const [ownershipScope, setOwnershipScope] = useState<OwnershipScope>("all");
+  const [classificationScope, setClassificationScope] = useState<string>("__all__");
+  const [sortKey, setSortKey] = useState<SortKey>("tree");
+  const [sortDirection, setSortDirection] = useState<SortDirection>("asc");
+  const [bulkMoveWorldId, setBulkMoveWorldId] = useState<string>("");
+  const [bulkMoveLoading, setBulkMoveLoading] = useState(false);
+  const [newClassificationDraft, setNewClassificationDraft] = useState("");
+  const [showTieMapper, setShowTieMapper] = useState(false);
+  const [tieMapSearch, setTieMapSearch] = useState("");
+  const [tieMapSelection, setTieMapSelection] = useState<string[]>([]);
+  
+  // Read-only mode for races owned by others
+  const [readOnlyMode, setReadOnlyMode] = useState(false);
+
+  // Skills for dropdowns
+  const [tier1Skills, setTier1Skills] = useState<Array<{ id: string; name: string }>>([]);
+  const [specialAbilitySkills, setSpecialAbilitySkills] = useState<Array<{ id: string; name: string }>>([]);
+
+  // Batch uploader state
+  const [batchText, setBatchText] = useState("");
+  const [batchError, setBatchError] = useState<string | null>(null);
+  const [batchPreview, setBatchPreview] = useState<RaceRecord[]>([]);
+  const [batchUploading, setBatchUploading] = useState(false);
+
+  // Load races and skills from database on mount
+  useEffect(() => {
+    async function loadData() {
+      try {
+        // Load current user
+        const userResponse = await fetch("/api/profile/me");
+        const userData = await userResponse.json();
+        if (userData.ok && userData.user) {
+          setCurrentUser({ id: userData.user.id, role: userData.user.role });
+        }
+
+        const [racesResponse, skillsResponse, worldsResponse] = await Promise.all([
+          fetch("/api/worldbuilder/races"),
+          fetch("/api/worldbuilder/skills"),
+          fetch("/api/worldbuilder/galaxy/worlds"),
+        ]);
+        const [racesData, skillsData, worldsData] = await Promise.all([
+          racesResponse.json(),
+          skillsResponse.json(),
+          worldsResponse.json().catch(() => ({ ok: false })),
+        ]);
+
+        if (!racesData.ok) {
+          throw new Error(racesData.error || "Failed to load creatures");
+        }
+
+        if (!skillsData.ok) {
+          throw new Error(skillsData.error || "Failed to load skills");
+        }
+
+        // Process skills
+        const allSkills = skillsData.skills || [];
+        const tier1 = allSkills
+          .filter((s: any) => s.tier === 1)
+          .map((s: any) => ({ id: s.id, name: s.name }))
+          .sort((a: any, b: any) => a.name.localeCompare(b.name));
+
+        const specials = allSkills
+          .filter((s: any) => s.type === "special ability")
+          .map((s: any) => ({ id: s.id, name: s.name }))
+          .sort((a: any, b: any) => a.name.localeCompare(b.name));
+
+        setTier1Skills(tier1);
+        setSpecialAbilitySkills(specials);
+
+        if (worldsResponse.ok && worldsData?.ok && Array.isArray(worldsData.worlds)) {
+          const worldRows: GalaxyWorldSummary[] = worldsData.worlds
+            .map((world: any) => ({
+              id: String(world.id),
+              name: String(world.name ?? "").trim() || "(unnamed world)",
+              canEdit: Boolean(world.canEdit),
+            }))
+            .sort((a: GalaxyWorldSummary, b: GalaxyWorldSummary) =>
+              a.name.localeCompare(b.name)
+            );
+          setWorlds(worldRows);
+        } else {
+          setWorlds([]);
+        }
+
+        // Transform API response to match our UI format
+        const transformed: RaceRecord[] = (racesData.races || []).map(mapApiRaceToRecord);
+
+        setRaces(transformed);
+      } catch (error) {
+        console.error("Error loading data:", error);
+        alert(
+          `Failed to load data: ${
+            error instanceof Error ? error.message : "Unknown error"
+          }`
+        );
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    loadData();
+  }, []);
+
+  const selected: RaceRecord | null = useMemo(
+    () =>
+      races.find((r) => String(r.id) === String(selectedId ?? "")) ?? null,
+    [races, selectedId]
+  );
+
+  // Check if selected race is editable
+  useEffect(() => {
+    if (selected) {
+      // Use canEdit flag from API response
+      setReadOnlyMode(!selected.canEdit);
+    } else {
+      setReadOnlyMode(false);
+    }
+  }, [selected]);
+
+  // ensure something is selected when the list changes
+  useEffect(() => {
+    if (!races.length) {
+      setSelectedId(null);
+      return;
+    }
+    if (!selected) {
+      const first = races[0];
+      if (first) setSelectedId(String(first.id));
+    }
+  }, [races, selected]);
+
+  useEffect(() => {
+    if (worldScope === "__all__" || worldScope === "__unassigned__") return;
+    if (!worlds.some((world) => world.id === worldScope)) {
+      setWorldScope("__all__");
+    }
+  }, [worldScope, worlds]);
+
+  const hierarchyByRaceId = useMemo(
+    () =>
+      buildRaceHierarchyMetaMap(
+        races.map((race) => ({
+          id: String(race.id),
+          name: race.name,
+          parentRaceId: race.parentRaceId ?? null,
+          parent2RaceId: race.parent2RaceId ?? null,
+        }))
+      ),
+    [races]
+  );
+
+  const scopedRaces = useMemo(() => {
+    if (worldScope === "__all__") return races;
+    if (worldScope === "__unassigned__") {
+      return races.filter((race) => !normalizeRaceParentId(race.worldId));
+    }
+    return races.filter((race) => String(race.worldId ?? "") === worldScope);
+  }, [races, worldScope]);
+
+  const orderedRaces = useMemo(() => sortRacesAsTree(scopedRaces), [scopedRaces]);
+
+  const selectedHierarchy = useMemo(() => {
+    if (!selected) return null;
+    return hierarchyByRaceId.get(String(selected.id)) ?? null;
+  }, [hierarchyByRaceId, selected]);
+
+  const parentCandidateRaces = useMemo(() => {
+    if (!selected) return orderedRaces;
+    const selectedWorldId = normalizeRaceParentId(selected.worldId);
+    const inSameWorld = races.filter(
+      (race) => normalizeRaceParentId(race.worldId) === selectedWorldId
+    );
+    return sortRacesAsTree(inSameWorld);
+  }, [orderedRaces, races, selected]);
+
+  const parentChoices = useMemo(() => {
+    if (!selected) return parentCandidateRaces;
+
+    const selectedIdStr = String(selected.id);
+    const childrenByParentId = new Map<string, string[]>();
+
+    for (const race of parentCandidateRaces) {
+      const childId = String(race.id);
+      for (const parentId of getRaceParentIds(race)) {
+        if (parentId === childId) continue;
+        const list = childrenByParentId.get(parentId) ?? [];
+        list.push(childId);
+        childrenByParentId.set(parentId, list);
+      }
+    }
+
+    const blockedIds = new Set<string>([selectedIdStr]);
+    const queue: string[] = [selectedIdStr];
+
+    while (queue.length > 0) {
+      const currentId = queue.shift();
+      if (!currentId) continue;
+      const childIds = childrenByParentId.get(currentId) ?? [];
+      for (const childId of childIds) {
+        if (blockedIds.has(childId)) continue;
+        blockedIds.add(childId);
+        queue.push(childId);
+      }
+    }
+
+    return parentCandidateRaces.filter((race) => !blockedIds.has(String(race.id)));
+  }, [parentCandidateRaces, selected]);
+
+  const classificationOptions = useMemo(() => {
+    return Array.from(
+      new Set(
+        scopedRaces.flatMap((race) =>
+          normalizeClassifications(race.classifications).map((label) => label.trim())
+        )
+      )
+    ).sort((a, b) => a.localeCompare(b));
+  }, [scopedRaces]);
+
+  const classificationEditorOptions = useMemo(() => {
+    return Array.from(
+      new Set(
+        races
+          .flatMap((race) =>
+            normalizeClassifications(race.classifications).map((label) => label.trim())
+          )
+          .concat(normalizeClassifications(selected?.classifications ?? []))
+      )
+    ).sort((a, b) => a.localeCompare(b));
+  }, [races, selected?.classifications]);
+
+  useEffect(() => {
+    if (classificationScope === "__all__") return;
+    if (!classificationOptions.includes(classificationScope)) {
+      setClassificationScope("__all__");
+    }
+  }, [classificationOptions, classificationScope]);
+
+  const filteredList = useMemo(() => {
+    const q = qtext.trim().toLowerCase();
+    let list = orderedRaces.filter((r) => {
+      const hierarchy = hierarchyByRaceId.get(String(r.id));
+      const base = [
+        r.name,
+        r.tagline,
+        normalizeClassifications(r.classifications).join(" "),
+        (hierarchy?.lineagePath ?? []).join(" "),
+        r.def.examples_by_genre ?? "",
+        r.def.cultural_mindset ?? "",
+      ]
+        .join(" ")
+        .toLowerCase();
+      if (q && !base.includes(q)) return false;
+
+      if (classificationScope !== "__all__") {
+        const labels = normalizeClassifications(r.classifications);
+        if (!labels.includes(classificationScope)) return false;
+      }
+
+      const hasAnyParent = getRaceParentIds(r).length > 0;
+      if (parentScope === "with-parent" && !hasAnyParent) return false;
+      if (parentScope === "top-level" && hasAnyParent) return false;
+
+      if (ownershipScope === "mine") {
+        if (!currentUser || r.createdBy !== currentUser.id) return false;
+      } else if (ownershipScope === "editable") {
+        if (!r.canEdit) return false;
+      } else if (ownershipScope === "readonly") {
+        if (r.canEdit !== false) return false;
+      }
+
+      return true;
+    });
+
+    if (sortKey === "tree") {
+      return sortDirection === "asc" ? list : [...list].reverse();
+    }
+
+    const compare = (a: RaceRecord, b: RaceRecord) => {
+      if (sortKey === "name") {
+        return (a.name || "").localeCompare(b.name || "");
+      }
+      if (sortKey === "classification") {
+        return String(normalizeClassifications(a.classifications)[0] ?? "").localeCompare(
+          String(normalizeClassifications(b.classifications)[0] ?? "")
+        );
+      }
+      if (sortKey === "created") {
+        return (
+          new Date(a.createdAt ?? 0).getTime() -
+          new Date(b.createdAt ?? 0).getTime()
+        );
+      }
+      return (
+        new Date(a.updatedAt ?? 0).getTime() -
+        new Date(b.updatedAt ?? 0).getTime()
+      );
+    };
+
+    list = [...list].sort((a, b) => {
+      const base = compare(a, b);
+      if (base !== 0) return sortDirection === "asc" ? base : -base;
+      return (a.name || "").localeCompare(b.name || "");
+    });
+
+    return list;
+  }, [
+    currentUser,
+    hierarchyByRaceId,
+    classificationScope,
+    orderedRaces,
+    ownershipScope,
+    parentScope,
+    qtext,
+    sortDirection,
+    sortKey,
+  ]);
+
+  const tieMapCandidates = useMemo(() => {
+    const q = tieMapSearch.trim().toLowerCase();
+    if (!q) return orderedRaces;
+    return orderedRaces.filter((race) => {
+      const hierarchy = hierarchyByRaceId.get(String(race.id));
+      const haystack = [
+        race.name,
+        normalizeClassifications(race.classifications).join(" "),
+        (hierarchy?.lineagePath ?? []).join(" "),
+      ]
+        .join(" ")
+        .toLowerCase();
+      return haystack.includes(q);
+    });
+  }, [hierarchyByRaceId, orderedRaces, tieMapSearch]);
+
+  const tieMapGraph = useMemo(() => {
+    const raceById = new Map(races.map((race) => [String(race.id), race]));
+    const selectedIds = tieMapSelection.filter((id) => raceById.has(id));
+    const selectedSet = new Set(selectedIds);
+    const nodeIds = new Set<string>(selectedIds);
+
+    for (const id of selectedIds) {
+      const race = raceById.get(id);
+      if (!race) continue;
+      const primaryParent = normalizeRaceParentId(race.parentRaceId);
+      const secondaryParent = normalizeRaceParentId(race.parent2RaceId);
+      if (primaryParent && raceById.has(primaryParent)) nodeIds.add(primaryParent);
+      if (secondaryParent && raceById.has(secondaryParent)) nodeIds.add(secondaryParent);
+    }
+
+    const parentageEdges: Array<{
+      parentId: string;
+      childId: string;
+      relation: "primary" | "secondary";
+    }> = [];
+
+    for (const nodeId of nodeIds) {
+      const race = raceById.get(nodeId);
+      if (!race) continue;
+      const primaryParent = normalizeRaceParentId(race.parentRaceId);
+      const secondaryParent = normalizeRaceParentId(race.parent2RaceId);
+      if (primaryParent && nodeIds.has(primaryParent)) {
+        parentageEdges.push({ parentId: primaryParent, childId: nodeId, relation: "primary" });
+      }
+      if (secondaryParent && nodeIds.has(secondaryParent)) {
+        parentageEdges.push({ parentId: secondaryParent, childId: nodeId, relation: "secondary" });
+      }
+    }
+
+    const incomingByChild = new Map<string, string[]>();
+    for (const edge of parentageEdges) {
+      const current = incomingByChild.get(edge.childId) ?? [];
+      current.push(edge.parentId);
+      incomingByChild.set(edge.childId, current);
+    }
+
+    const depthMemo = new Map<string, number>();
+    const depthStack = new Set<string>();
+    const depthFor = (id: string): number => {
+      if (depthMemo.has(id)) return depthMemo.get(id) ?? 0;
+      if (depthStack.has(id)) return 0;
+      depthStack.add(id);
+      const parents = incomingByChild.get(id) ?? [];
+      const depth =
+        parents.length === 0
+          ? 0
+          : Math.max(...parents.map((parentId) => depthFor(parentId) + 1));
+      depthMemo.set(id, depth);
+      depthStack.delete(id);
+      return depth;
+    };
+
+    const nodes = Array.from(nodeIds)
+      .map((id) => ({
+        id,
+        name: raceById.get(id)?.name?.trim() || "(unnamed)",
+        selected: selectedSet.has(id),
+        depth: depthFor(id),
+      }))
+      .sort((a, b) => {
+        if (a.depth !== b.depth) return a.depth - b.depth;
+        return a.name.localeCompare(b.name);
+      });
+
+    const layers = Array.from(
+      nodes.reduce((map, node) => {
+        const list = map.get(node.depth) ?? [];
+        list.push(node);
+        map.set(node.depth, list);
+        return map;
+      }, new Map<number, Array<(typeof nodes)[number]>>())
+    ).sort((a, b) => a[0] - b[0]);
+
+    const classificationGroups = new Map<string, { label: string; ids: string[] }>();
+    for (const nodeId of nodeIds) {
+      const race = raceById.get(nodeId);
+      if (!race) continue;
+      for (const label of normalizeClassifications(race.classifications)) {
+        const key = label.trim().toLowerCase();
+        if (!key) continue;
+        const existing = classificationGroups.get(key);
+        if (existing) {
+          if (!existing.ids.includes(nodeId)) existing.ids.push(nodeId);
+        } else {
+          classificationGroups.set(key, { label, ids: [nodeId] });
+        }
+      }
+    }
+
+    const classificationPairMap = new Map<
+      string,
+      { leftId: string; rightId: string; labels: Set<string> }
+    >();
+    for (const group of classificationGroups.values()) {
+      const uniqueIds = Array.from(new Set(group.ids)).sort();
+      if (uniqueIds.length < 2) continue;
+      for (let i = 0; i < uniqueIds.length; i++) {
+        for (let j = i + 1; j < uniqueIds.length; j++) {
+          const leftId = uniqueIds[i];
+          const rightId = uniqueIds[j];
+          if (!leftId || !rightId) continue;
+          const key = `${leftId}::${rightId}`;
+          const existing = classificationPairMap.get(key);
+          if (existing) {
+            existing.labels.add(group.label);
+          } else {
+            classificationPairMap.set(key, {
+              leftId,
+              rightId,
+              labels: new Set([group.label]),
+            });
+          }
+        }
+      }
+    }
+
+    const classificationEdges = Array.from(classificationPairMap.values())
+      .map((entry) => ({
+        leftId: entry.leftId,
+        rightId: entry.rightId,
+        labels: Array.from(entry.labels).sort((a, b) => a.localeCompare(b)),
+      }))
+      .sort((a, b) => {
+        const leftA = raceById.get(a.leftId)?.name ?? a.leftId;
+        const leftB = raceById.get(b.leftId)?.name ?? b.leftId;
+        const leftCmp = leftA.localeCompare(leftB);
+        if (leftCmp !== 0) return leftCmp;
+        const rightA = raceById.get(a.rightId)?.name ?? a.rightId;
+        const rightB = raceById.get(b.rightId)?.name ?? b.rightId;
+        return rightA.localeCompare(rightB);
+      });
+
+    return {
+      selectedCount: selectedIds.length,
+      nodes,
+      parentageEdges,
+      classificationEdges,
+      layers,
+    };
+  }, [races, tieMapSelection]);
+
+  useEffect(() => {
+    setTieMapSelection((prev) =>
+      prev.filter((id) => races.some((race) => String(race.id) === id))
+    );
+  }, [races]);
+
+  useEffect(() => {
+    if (filteredList.length === 0) return;
+    const selectedStillVisible = filteredList.some(
+      (race) => String(race.id) === String(selectedId ?? "")
+    );
+    if (!selectedStillVisible) {
+      setSelectedId(String(filteredList[0]?.id ?? ""));
+    }
+  }, [filteredList, selectedId]);
+
+  const activeScopeWorldId: string | null =
+    worldScope !== "__all__" && worldScope !== "__unassigned__" ? worldScope : null;
+  const myCreatureCount = useMemo(
+    () =>
+      races.filter(
+        (race) => race.createdBy && race.createdBy === currentUser?.id
+      ).length,
+    [currentUser?.id, races]
+  );
+
+  async function refreshRacesFromApi() {
+    const response = await fetch("/api/worldbuilder/races");
+    const data = await response.json();
+    if (!data.ok) {
+      throw new Error(data.error || "Failed to reload creatures");
+    }
+    setRaces((data.races || []).map(mapApiRaceToRecord));
+  }
+
+  /* ---------- library CRUD helpers (UI-only) ---------- */
+
+  function createRace() {
+    const id = uid();
+    const scopedWorldId = activeScopeWorldId;
+    const scopedWorldName =
+      worlds.find((world) => world.id === scopedWorldId)?.name ?? null;
+    const nowIso = new Date().toISOString();
+    const newRace: RaceRecord = {
+      id,
+      worldId: scopedWorldId,
+      worldName: scopedWorldName,
+      parentRaceId: null,
+      parent2RaceId: null,
+      name: "New Creature",
+      tagline: "",
+      is_free: false,
+      canEdit: true, // New races are always editable by creator
+      classifications: [],
+      lineageDepth: 0,
+      lineagePath: ["New Creature"],
+      hasLineageCycle: false,
+      def: {},
+      attr: {},
+      bonusRows: makeBonusRows(MAX_BONUS_SKILLS),
+      specialRows: makeBonusRows(MAX_SPECIALS),
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    };
+    setRaces((prev) => [newRace, ...prev]);
+    setSelectedId(id);
+  }
+
+  async function deleteSelected() {
+    if (!selected || !currentUser) return;
+
+    const isAdminLocal = currentUser.role?.toLowerCase() === "admin";
+    const isCreator = selected.createdBy === currentUser.id;
+
+    if (!isAdminLocal && !isCreator) {
+      alert("You can only delete creatures you created. Admins can delete any creature.");
+      return;
+    }
+
+    if (!confirm("Delete this creature from the library?")) return;
+
+    const idStr = String(selected.id);
+    const isNew = typeof selected.id === "string" && !isUuidLike(selected.id);
+
+    // If it's a UI-only race (not yet saved), just remove from state
+    if (isNew) {
+      setRaces((prev) => prev.filter((r) => String(r.id) !== idStr));
+      setSelectedId(null);
+      return;
+    }
+
+    try {
+      const response = await fetch(`/api/worldbuilder/races/${selected.id}`, {
+        method: "DELETE",
+      });
+
+      const data = await response.json();
+
+      if (!data.ok) {
+        throw new Error(data.error || "Failed to delete creature");
+      }
+
+      setRaces((prev) => prev.filter((r) => String(r.id) !== idStr));
+      setSelectedId(null);
+      alert("Creature deleted successfully!");
+    } catch (error) {
+      console.error("Error deleting creature:", error);
+      alert(
+        `Failed to delete creature: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`
+      );
+    }
+  }
+
+  function updateSelected(patch: Partial<RaceRecord>) {
+    if (!selected) return;
+    const idStr = String(selected.id);
+    setRaces((prev) =>
+      prev.map((r) =>
+        String(r.id) === idStr ? ({ ...r, ...patch } as RaceRecord) : r
+      )
+    );
+  }
+
+  function updateDef<K extends keyof RaceDefinition>(key: K, value: string) {
+    if (!selected) return;
+    const idStr = String(selected.id);
+    setRaces((prev) =>
+      prev.map((r) =>
+        String(r.id) === idStr
+          ? ({
+              ...r,
+              def: { ...(r.def || {}), [key]: value },
+            } as RaceRecord)
+          : r
+      )
+    );
+  }
+
+  function updateAttr<K extends keyof RaceAttributes>(key: K, value: string) {
+    if (!selected) return;
+    const idStr = String(selected.id);
+    setRaces((prev) =>
+      prev.map((r) =>
+        String(r.id) === idStr
+          ? ({
+              ...r,
+              attr: { ...(r.attr || {}), [key]: value },
+            } as RaceRecord)
+          : r
+      )
+    );
+  }
+
+  function updateBonusRow(
+    idx: number,
+    field: "skillName" | "points",
+    value: string
+  ) {
+    if (!selected) return;
+    const idStr = String(selected.id);
+    setRaces((prev) =>
+      prev.map((r) => {
+        if (String(r.id) !== idStr) return r;
+        const updatedRows = r.bonusRows.map((row) =>
+          row.slotIdx === idx ? { ...row, [field]: value } : row
+        );
+        return { ...r, bonusRows: updatedRows } as RaceRecord;
+      })
+    );
+  }
+
+  function updateSpecialRow(
+    idx: number,
+    field: "skillName" | "points",
+    value: string
+  ) {
+    if (!selected) return;
+    const idStr = String(selected.id);
+    setRaces((prev) =>
+      prev.map((r) => {
+        if (String(r.id) !== idStr) return r;
+        const updatedRows = r.specialRows.map((row) =>
+          row.slotIdx === idx ? { ...row, [field]: value } : row
+        );
+        return { ...r, specialRows: updatedRows } as RaceRecord;
+      })
+    );
+  }
+
+  function addClassificationRow() {
+    if (!selected) return;
+    const idStr = String(selected.id);
+    setRaces((prev) =>
+      prev.map((r) =>
+        String(r.id) === idStr
+          ? ({ ...r, classifications: [...normalizeClassificationRows(r.classifications), ""] } as RaceRecord)
+          : r
+      )
+    );
+  }
+
+  function updateClassificationRow(idx: number, value: string) {
+    if (!selected) return;
+    const idStr = String(selected.id);
+    setRaces((prev) =>
+      prev.map((r) => {
+        if (String(r.id) !== idStr) return r;
+        const next = [...normalizeClassificationRows(r.classifications)];
+        if (idx < 0 || idx >= next.length) return r;
+        next[idx] = value.trim();
+        return { ...r, classifications: normalizeClassificationRows(next) } as RaceRecord;
+      })
+    );
+  }
+
+  function removeClassificationRow(idx: number) {
+    if (!selected) return;
+    const idStr = String(selected.id);
+    setRaces((prev) =>
+      prev.map((r) => {
+        if (String(r.id) !== idStr) return r;
+        const next = normalizeClassificationRows(r.classifications).filter(
+          (_, rowIdx) => rowIdx !== idx
+        );
+        return { ...r, classifications: next } as RaceRecord;
+      })
+    );
+  }
+
+  function addCustomClassification() {
+    if (!selected) return;
+    const label = newClassificationDraft.trim();
+    if (!label) return;
+
+    const idStr = String(selected.id);
+    setRaces((prev) =>
+      prev.map((r) => {
+        if (String(r.id) !== idStr) return r;
+
+        const current = normalizeClassificationRows(r.classifications);
+        const duplicate = current.some(
+          (entry) => entry.trim().toLowerCase() === label.toLowerCase()
+        );
+        if (duplicate) return r;
+
+        const blankIndex = current.findIndex((entry) => entry.trim().length === 0);
+        if (blankIndex >= 0) {
+          const next = [...current];
+          next[blankIndex] = label;
+          return { ...r, classifications: normalizeClassificationRows(next) } as RaceRecord;
+        }
+
+        return {
+          ...r,
+          classifications: normalizeClassificationRows([...current, label]),
+        } as RaceRecord;
+      })
+    );
+    setNewClassificationDraft("");
+  }
+
+  function toggleTieMapRace(raceId: string) {
+    setTieMapSelection((prev) =>
+      prev.includes(raceId)
+        ? prev.filter((id) => id !== raceId)
+        : [...prev, raceId]
+    );
+  }
+
+  function toggleTieMapper() {
+    setShowTieMapper((prev) => {
+      const next = !prev;
+      if (next) {
+        setTieMapSelection((current) =>
+          current.length > 0
+            ? current
+            : selectedId
+              ? [String(selectedId)]
+              : []
+        );
+      }
+      return next;
+    });
+  }
+
+  async function saveSelected() {
+    if (!selected) return;
+    
+    // Prevent saving if in read-only mode
+    if (readOnlyMode) {
+      alert("You cannot edit this creature. It was created by another user.");
+      return;
+    }
+
+    try {
+      // Transform bonusRows and specialRows into the JSONB format expected by the API
+      const bonusSkills = selected.bonusRows
+        .filter((r) => r.skillName.trim() !== "")
+        .map((r) => ({
+          skillName: r.skillName,
+          points: parseInt(r.points) || 0,
+        }));
+
+      const specialAbilities = selected.specialRows
+        .filter((r) => r.skillName.trim() !== "")
+        .map((r) => ({
+          skillName: r.skillName,
+          points: parseInt(r.points) || 0,
+        }));
+
+      const payload = {
+        name: selected.name,
+        worldId: selected.worldId || null,
+        parentRaceId: selected.parentRaceId || null,
+        parent2RaceId: selected.parent2RaceId || null,
+        classifications: normalizeClassifications(selected.classifications),
+        tagline: selected.tagline || null,
+        isFree: selected.is_free ?? false,
+        definition: selected.def,
+        attributes: selected.attr,
+        bonusSkills,
+        specialAbilities,
+      };
+
+      // Check if this is a new race (string ID means UI-only) or existing (UUID means from DB)
+      const isNew = typeof selected.id === "string" && !isUuidLike(selected.id);
+
+      let response;
+      if (isNew) {
+        // Create new race
+        response = await fetch("/api/worldbuilder/races", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+      } else {
+        // Update existing race
+        response = await fetch(`/api/worldbuilder/races/${selected.id}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+      }
+
+      const data = await response.json();
+
+      if (!data.ok) {
+        throw new Error(data.error || "Failed to save creature");
+      }
+
+      if (data.race) {
+        const oldId = selected.id;
+        setRaces((prev) =>
+          prev.map((r) => {
+            if (String(r.id) !== String(oldId)) return r;
+            return {
+              ...r,
+              id: data.race.id ?? r.id,
+              worldId: data.race.worldId ?? null,
+              worldName: data.race.worldName ?? null,
+              parentRaceId: data.race.parentRaceId ?? null,
+              parent2RaceId: data.race.parent2RaceId ?? null,
+              createdBy: data.race.createdBy ?? r.createdBy,
+              canEdit: data.race.canEdit ?? r.canEdit,
+              classifications: resolveRaceClassifications(data.race, r.classifications),
+              lineageDepth:
+                typeof data.race.lineageDepth === "number"
+                  ? data.race.lineageDepth
+                  : r.lineageDepth,
+              lineagePath: Array.isArray(data.race.lineagePath)
+                ? data.race.lineagePath
+                : r.lineagePath,
+              hasLineageCycle:
+                data.race.hasLineageCycle !== undefined
+                  ? Boolean(data.race.hasLineageCycle)
+                  : r.hasLineageCycle,
+              createdAt:
+                typeof data.race.createdAt === "string" ? data.race.createdAt : r.createdAt,
+              updatedAt:
+                typeof data.race.updatedAt === "string" ? data.race.updatedAt : r.updatedAt,
+            } as RaceRecord;
+          })
+        );
+
+        if (isNew && data.race.id) {
+          setSelectedId(String(data.race.id));
+        }
+      }
+
+      alert("Creature saved successfully!");
+    } catch (error) {
+      console.error("Error saving creature:", error);
+      alert(
+        `Failed to save creature: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`
+      );
+    }
+  }
+
+  async function moveAllMyCreaturesToWorld() {
+    if (!currentUser) return;
+    if (!bulkMoveWorldId) {
+      alert("Choose a destination world first.");
+      return;
+    }
+    if (myCreatureCount <= 0) {
+      alert("You do not have any saved creatures to move.");
+      return;
+    }
+
+    const targetWorldName =
+      worlds.find((world) => world.id === bulkMoveWorldId)?.name ?? bulkMoveWorldId;
+    const confirmed = confirm(
+      `Move all ${myCreatureCount} of your creatures to "${targetWorldName}"?`
+    );
+    if (!confirmed) return;
+
+    setBulkMoveLoading(true);
+    try {
+      const response = await fetch("/api/worldbuilder/races/bulk-world", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ targetWorldId: bulkMoveWorldId }),
+      });
+      const data = await response.json();
+      if (!data.ok) {
+        throw new Error(data.error || "Failed to move creatures");
+      }
+      await refreshRacesFromApi();
+      alert(`Moved ${data.movedCount ?? 0} creature records.`);
+    } catch (error) {
+      console.error("Bulk move error:", error);
+      alert(
+        `Failed to move creatures: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`
+      );
+    } finally {
+      setBulkMoveLoading(false);
+    }
+  }
+
+  /* ---------- batch uploader actions ---------- */
+
+  function handleParseBatch() {
+    try {
+      if (!batchText.trim()) {
+        setBatchError("Paste tab-separated rows from your sheet first.");
+        setBatchPreview([]);
+        return;
+      }
+      const parsed = parseTSVToRaceRecords(batchText);
+      if (!parsed.length) {
+        setBatchError("No valid creature rows found.");
+        setBatchPreview([]);
+        return;
+      }
+      setBatchPreview(parsed);
+      setBatchError(null);
+    } catch (err) {
+      console.error("Batch parse error:", err);
+      setBatchPreview([]);
+      setBatchError(
+        err instanceof Error ? err.message : "Failed to parse batch data."
+      );
+    }
+  }
+
+  async function handleCommitBatch() {
+    if (!isAdmin) return;
+    if (!batchPreview.length) {
+      alert("Parse some data first.");
+      return;
+    }
+    if (
+      !confirm(
+        `Import/update ${batchPreview.length} creatures? Matches are based on creature name (case-insensitive).`
+      )
+    ) {
+      return;
+    }
+
+    setBatchUploading(true);
+    try {
+      const updatedRaces = [...races];
+
+      for (const row of batchPreview) {
+        const name = row.name.trim();
+        if (!name) continue;
+
+        const existingIdx = updatedRaces.findIndex(
+          (r) => r.name.trim().toLowerCase() === name.toLowerCase()
+        );
+
+        const bonusSkills = row.bonusRows
+          .filter((r) => r.skillName.trim() !== "")
+          .map((r) => ({
+            skillName: r.skillName,
+            points: parseInt(r.points) || 0,
+          }));
+
+        const specialAbilities = row.specialRows
+          .filter((r) => r.skillName.trim() !== "")
+          .map((r) => ({
+            skillName: r.skillName,
+            points: parseInt(r.points) || 0,
+          }));
+
+        const existing = existingIdx >= 0 ? updatedRaces[existingIdx] ?? null : null;
+        const payload = {
+          name: row.name,
+          worldId: existing?.worldId ?? activeScopeWorldId,
+          classifications: normalizeClassifications(row.classifications),
+          tagline: row.tagline || null,
+          isFree: row.is_free ?? false,
+          definition: row.def,
+          attributes: row.attr,
+          bonusSkills,
+          specialAbilities,
+        };
+
+        let response;
+        if (existingIdx >= 0) {
+          // Update existing race by name
+          if (!existing) continue;
+          response = await fetch(`/api/worldbuilder/races/${existing.id}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+        } else {
+          // Create new race
+          response = await fetch("/api/worldbuilder/races", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+        }
+
+        const data = await response.json();
+        if (!data.ok) {
+          throw new Error(
+            data.error || `Failed to save creature "${row.name}"`
+          );
+        }
+
+        if (existingIdx >= 0) {
+          // Merge preview data into the existing local record
+          const existing = updatedRaces[existingIdx];
+          if (!existing) continue;
+          const savedRace = data.race ?? null;
+          updatedRaces[existingIdx] = {
+            ...existing,
+            name: savedRace?.name ?? row.name,
+            worldId: savedRace?.worldId ?? existing.worldId ?? null,
+            worldName: savedRace?.worldName ?? existing.worldName ?? null,
+            parentRaceId: savedRace?.parentRaceId ?? existing.parentRaceId ?? null,
+            parent2RaceId:
+              savedRace?.parent2RaceId ?? existing.parent2RaceId ?? null,
+            tagline: savedRace?.tagline ?? row.tagline,
+            is_free: savedRace?.isFree ?? row.is_free,
+            def: row.def,
+            attr: row.attr,
+            bonusRows: row.bonusRows,
+            specialRows: row.specialRows,
+            classifications: resolveRaceClassifications(savedRace, existing.classifications),
+            lineageDepth:
+              typeof savedRace?.lineageDepth === "number"
+                ? savedRace.lineageDepth
+                : existing.lineageDepth,
+            lineagePath: Array.isArray(savedRace?.lineagePath)
+              ? savedRace.lineagePath
+              : existing.lineagePath,
+            hasLineageCycle:
+              savedRace?.hasLineageCycle !== undefined
+                ? Boolean(savedRace.hasLineageCycle)
+                : existing.hasLineageCycle,
+            createdAt:
+              typeof savedRace?.createdAt === "string"
+                ? savedRace.createdAt
+                : existing.createdAt,
+            updatedAt:
+              typeof savedRace?.updatedAt === "string"
+                ? savedRace.updatedAt
+                : existing.updatedAt,
+          };
+        } else if (data.race) {
+          // Add new race using the preview data plus server ID and canEdit flag
+          updatedRaces.unshift({
+            ...row,
+            id: data.race.id,
+            worldId: data.race.worldId ?? payload.worldId ?? null,
+            worldName:
+              data.race.worldName ??
+              worlds.find((world) => world.id === payload.worldId)?.name ??
+              null,
+            parentRaceId: data.race.parentRaceId ?? null,
+            parent2RaceId: data.race.parent2RaceId ?? null,
+            name: data.race.name ?? row.name,
+            tagline: data.race.tagline ?? row.tagline,
+            createdBy: data.race.createdBy,
+            canEdit: true, // Admin uploaded, so editable
+            classifications: resolveRaceClassifications(data.race, row.classifications),
+            lineageDepth:
+              typeof data.race.lineageDepth === "number"
+                ? data.race.lineageDepth
+                : 0,
+            lineagePath: Array.isArray(data.race.lineagePath)
+              ? data.race.lineagePath
+              : [row.name],
+            hasLineageCycle: Boolean(data.race.hasLineageCycle),
+            createdAt:
+              typeof data.race.createdAt === "string"
+                ? data.race.createdAt
+                : new Date().toISOString(),
+            updatedAt:
+              typeof data.race.updatedAt === "string"
+                ? data.race.updatedAt
+                : new Date().toISOString(),
+          });
+        }
+      }
+
+      setRaces(updatedRaces);
+      setBatchText("");
+      setBatchPreview([]);
+      setBatchError(null);
+      alert("Batch upload complete.");
+    } catch (err) {
+      console.error("Batch upload error:", err);
+      alert(
+        `Batch upload failed: ${
+          err instanceof Error ? err.message : "Unknown error"
+        }`
+      );
+    } finally {
+      setBatchUploading(false);
+    }
+  }
+
+  /* ---------- preview text ---------- */
+
+  const previewText = useMemo(() => {
+    if (!selected) return "";
+
+    const { name, tagline, def, attr, bonusRows, specialRows } = selected;
+
+    const nv = (x: any) =>
+      x == null || x === "" ? "—" : String(x).trim() === "" ? "—" : x;
+
+    const lines: string[] = [];
+
+    lines.push(`Creature: ${name || "New Creature"}`);
+    if (tagline) {
+      lines.push(`"${tagline}"`);
+    }
+    lines.push(
+      `World: ${
+        selected.worldName ||
+        worlds.find((world) => world.id === selected.worldId)?.name ||
+        "(unassigned)"
+      }`
+    );
+    const parentNames = getRaceParentIds(selected).map((parentId) => {
+      const parentMatch = races.find((race) => String(race.id) === parentId);
+      const parentName = parentMatch?.name?.trim();
+      return parentName || parentId;
+    });
+    lines.push(
+      `Parents: ${parentNames.length > 0 ? parentNames.join(" + ") : "(none)"}`
+    );
+    lines.push(
+      `Classifications: ${
+        normalizeClassifications(selected.classifications).join(", ") || "(none)"
+      }`
+    );
+    lines.push(`Lineage Path: ${(selectedHierarchy?.lineagePath ?? [name || "New Creature"]).join(" > ")}`);
+    lines.push("");
+
+    // Identity / lore
+    lines.push("— Identity & Lore —");
+    const defEntries: [string, string | null | undefined][] = [
+      ["Legacy Description", def.legacy_description],
+      ["Physical Characteristics", def.physical_characteristics],
+      ["Physical Description", def.physical_description],
+      ["Racial Quirk", def.racial_quirk],
+      ["Quirk Success Effect", def.quirk_success_effect],
+      ["Quirk Failure Effect", def.quirk_failure_effect],
+      ["Common Languages Known", def.common_languages_known],
+      ["Common Archetypes", def.common_archetypes],
+      ["Examples by Genre", def.examples_by_genre],
+      ["Cultural Mindset", def.cultural_mindset],
+      ["Outlook on Magic", def.outlook_on_magic],
+    ];
+
+    defEntries.forEach(([label, v]) => {
+      if (!v || String(v).trim() === "") return;
+      const value = String(v);
+      const clipped =
+        value.length > 200 ? `${value.slice(0, 200)}…` : value;
+      lines.push(`${label}: ${clipped}`);
+    });
+
+    lines.push("");
+    lines.push("— Attributes —");
+    lines.push(`Age / Size: ${nv(attr.age_range)} / ${nv(attr.size)}`);
+    lines.push(
+      `STR / DEX / CON: ${nv(attr.strength_max)} / ${nv(
+        attr.dexterity_max
+      )} / ${nv(attr.constitution_max)}`
+    );
+    lines.push(
+      `INT / WIS / CHA: ${nv(attr.intelligence_max)} / ${nv(
+        attr.wisdom_max
+      )} / ${nv(attr.charisma_max)}`
+    );
+    lines.push(
+      `Base Magic / Movement: ${nv(attr.base_magic)} / ${nv(
+        attr.base_movement
+      )}`
+    );
+
+    lines.push("");
+    lines.push("— Bonus Skills —");
+    const bonusActive = bonusRows.filter(
+      (b) => b.skillName.trim() !== ""
+    );
+    if (bonusActive.length === 0) {
+      lines.push(" • (none)");
+    } else {
+      bonusActive.forEach((b) => {
+        lines.push(` • ${b.skillName} (+${b.points || "0"})`);
+      });
+    }
+
+    lines.push("");
+    lines.push("— Creature Special Abilities —");
+    const specialActive = specialRows.filter(
+      (s) => s.skillName.trim() !== ""
+    );
+    if (specialActive.length === 0) {
+      lines.push(" • (none)");
+    } else {
+      specialActive.forEach((s) => {
+        lines.push(` • ${s.skillName} (+${s.points || "0"})`);
+      });
+    }
+
+    return lines.join("\n");
+  }, [races, selected, selectedHierarchy, worlds]);
+
+  /* ---------- render ---------- */
+
+  return (
+    <main className="min-h-screen px-6 py-10">
+      {/* Header */}
+      <header className="max-w-7xl mx-auto mb-6 flex flex-col gap-4">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+          <div>
+            <GradientText
+              as="h1"
+              variant="title"
+              glow
+              className="font-evanescent text-4xl sm:text-5xl tracking-tight"
+            >
+              The Source Forge - Creatures
+            </GradientText>
+            <p className="mt-1 text-sm text-zinc-300/90 max-w-2xl">
+              Define creature lore, attribute caps, and creature bonuses.
+              This screen now supports admin-only batch uploads from
+              your design sheets.
+            </p>
+          </div>
+
+          <div className="flex gap-3 justify-end">
+            <Link href="/worldbuilder/toolbox">
+              <Button variant="secondary" size="sm">
+                {"<-"} Toolbox
+              </Button>
+            </Link>
+          </div>
+        </div>
+
+        <div className="flex justify-end">
+          <WBNav current="creatures" />
+        </div>
+      </header>
+
+      <section className="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-[280px,1fr] gap-6">
+        {/* Left column: Creature Library */}
+        <Card
+          padded={false}
+          className="rounded-3xl border border-white/10 bg-white/5 backdrop-blur p-5 shadow-2xl flex flex-col gap-4"
+        >
+          <div className="flex items-center justify-between gap-2">
+            <h2 className="text-sm font-semibold text-zinc-200">
+              Creature Library
+            </h2>
+            <Button
+              variant="primary"
+              size="sm"
+              type="button"
+              onClick={createRace}
+            >
+              + New Creature
+            </Button>
+          </div>
+
+          {/* Filter */}
+          <div className="space-y-2">
+            <Input
+              value={qtext}
+              onChange={(e) => setQtext(e.target.value)}
+              placeholder="Search creatures by name, classification, or lore..."
+            />
+            <div className="grid grid-cols-1 gap-2">
+              <select
+                value={worldScope}
+                onChange={(e) => setWorldScope(e.target.value as WorldScope)}
+                className="w-full rounded-md border border-white/15 bg-black/50 px-2 py-1.5 text-xs text-zinc-100 outline-none focus:ring-2 focus:ring-amber-400/40"
+              >
+                <option value="__all__">World Scope: All Worlds</option>
+                <option value="__unassigned__">World Scope: Unassigned Only</option>
+                {worlds.map((world) => (
+                  <option key={world.id} value={world.id}>
+                    {`World Scope: ${world.name}`}
+                  </option>
+                ))}
+              </select>
+
+              <div className="grid grid-cols-2 gap-2">
+                <select
+                  value={ownershipScope}
+                  onChange={(e) => setOwnershipScope(e.target.value as OwnershipScope)}
+                  className="w-full rounded-md border border-white/15 bg-black/50 px-2 py-1.5 text-xs text-zinc-100 outline-none focus:ring-2 focus:ring-amber-400/40"
+                >
+                  <option value="all">Ownership: All</option>
+                  <option value="mine">Ownership: Mine</option>
+                  <option value="editable">Ownership: Editable</option>
+                  <option value="readonly">Ownership: Read-Only</option>
+                </select>
+                <select
+                  value={parentScope}
+                  onChange={(e) => setParentScope(e.target.value as ParentScope)}
+                  className="w-full rounded-md border border-white/15 bg-black/50 px-2 py-1.5 text-xs text-zinc-100 outline-none focus:ring-2 focus:ring-amber-400/40"
+                >
+                  <option value="all">Parent Scope: All</option>
+                  <option value="with-parent">Parent Scope: Has Parent</option>
+                  <option value="top-level">Parent Scope: Top Level</option>
+                </select>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <select
+                  value={classificationScope}
+                  onChange={(e) => setClassificationScope(e.target.value)}
+                  className="w-full rounded-md border border-white/15 bg-black/50 px-2 py-1.5 text-xs text-zinc-100 outline-none focus:ring-2 focus:ring-amber-400/40"
+                >
+                  <option value="__all__">Classification: All</option>
+                  {classificationOptions.map((label) => (
+                    <option key={label} value={label}>
+                      {`Classification: ${label}`}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  value={sortKey}
+                  onChange={(e) => setSortKey(e.target.value as SortKey)}
+                  className="w-full rounded-md border border-white/15 bg-black/50 px-2 py-1.5 text-xs text-zinc-100 outline-none focus:ring-2 focus:ring-amber-400/40"
+                >
+                  <option value="tree">Sort: Tree</option>
+                  <option value="name">Sort: Name</option>
+                  <option value="classification">Sort: Classification</option>
+                  <option value="updated">Sort: Updated Time</option>
+                  <option value="created">Sort: Created Time</option>
+                </select>
+              </div>
+
+              <select
+                value={sortDirection}
+                onChange={(e) => setSortDirection(e.target.value as SortDirection)}
+                className="w-full rounded-md border border-white/15 bg-black/50 px-2 py-1.5 text-xs text-zinc-100 outline-none focus:ring-2 focus:ring-amber-400/40"
+              >
+                <option value="asc">Direction: Ascending</option>
+                <option value="desc">Direction: Descending</option>
+              </select>
+
+              <div className="rounded-xl border border-sky-300/30 bg-sky-300/5 p-2 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-[11px] font-semibold text-sky-100">
+                    Species Sort Tools
+                  </p>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    type="button"
+                    onClick={toggleTieMapper}
+                  >
+                    {showTieMapper ? "Hide Tie Map" : "Map Racial Ties"}
+                  </Button>
+                </div>
+
+                {showTieMapper ? (
+                  <div className="space-y-2">
+                    <Input
+                      value={tieMapSearch}
+                      onChange={(e) => setTieMapSearch(e.target.value)}
+                      placeholder="Find creatures to include in tie map..."
+                      className="min-h-[40px] px-3 py-2 text-sm"
+                    />
+
+                    <div className="max-h-[150px] overflow-auto rounded-lg border border-white/10 bg-black/30 p-2 space-y-1">
+                      {tieMapCandidates.length === 0 ? (
+                        <p className="text-xs text-zinc-500">
+                          No creatures match this map search.
+                        </p>
+                      ) : (
+                        tieMapCandidates.map((raceOption) => {
+                          const raceId = String(raceOption.id);
+                          const checked = tieMapSelection.includes(raceId);
+                          return (
+                            <label
+                              key={`tie-map-${raceId}`}
+                              className="flex items-start gap-2 text-xs text-zinc-200"
+                            >
+                              <input
+                                type="checkbox"
+                                checked={checked}
+                                onChange={() => toggleTieMapRace(raceId)}
+                              />
+                              <span>
+                                <span className="font-medium">{raceOption.name || "(unnamed)"}</span>
+                                <span className="ml-1 text-zinc-400">
+                                  {normalizeClassifications(raceOption.classifications).join(", ") || "unclassified"}
+                                </span>
+                              </span>
+                            </label>
+                          );
+                        })
+                      )}
+                    </div>
+
+                    <div className="rounded-lg border border-white/10 bg-black/30 p-2 space-y-2">
+                      <p className="text-[11px] uppercase tracking-wide text-zinc-400">
+                        {`Mapped Races: ${tieMapGraph.selectedCount}`}
+                      </p>
+
+                      {tieMapGraph.selectedCount === 0 ? (
+                        <p className="text-xs text-zinc-500">
+                          Select one or more creatures to map lineage ties.
+                        </p>
+                      ) : (
+                        <>
+                          <div className="space-y-1">
+                            {tieMapGraph.layers.map(([depth, layerNodes]) => (
+                              <div key={`layer-${depth}`} className="space-y-1">
+                                <p className="text-[11px] text-zinc-400">{`Tier ${depth}`}</p>
+                                <div className="flex flex-wrap gap-1.5">
+                                  {layerNodes.map((node) => (
+                                    <span
+                                      key={`node-${node.id}`}
+                                      className={`rounded-md border px-2 py-1 text-[11px] ${
+                                        node.selected
+                                          ? "border-sky-300/40 bg-sky-300/10 text-sky-100"
+                                          : "border-white/15 bg-white/5 text-zinc-300"
+                                      }`}
+                                    >
+                                      {node.name}
+                                    </span>
+                                  ))}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+
+                          <div className="border-t border-white/10 pt-2">
+                            <p className="text-[11px] text-zinc-400 mb-1">Parentage Ties</p>
+                            {tieMapGraph.parentageEdges.length === 0 ? (
+                              <p className="text-xs text-zinc-500">
+                                No mapped parentage ties yet.
+                              </p>
+                            ) : (
+                              <ul className="space-y-1">
+                                {tieMapGraph.parentageEdges.map((edge, idx) => {
+                                  const parentName =
+                                    tieMapGraph.nodes.find((node) => node.id === edge.parentId)?.name ||
+                                    edge.parentId;
+                                  const childName =
+                                    tieMapGraph.nodes.find((node) => node.id === edge.childId)?.name ||
+                                    edge.childId;
+                                  return (
+                                    <li
+                                      key={`tie-parent-${edge.parentId}-${edge.childId}-${edge.relation}-${idx}`}
+                                      className="text-[11px] text-zinc-300"
+                                    >
+                                      {`${parentName} -> ${childName} (${edge.relation === "primary" ? "primary parentage" : "secondary parentage"})`}
+                                    </li>
+                                  );
+                                })}
+                              </ul>
+                            )}
+                          </div>
+
+                          <div className="border-t border-white/10 pt-2">
+                            <p className="text-[11px] text-zinc-400 mb-1">Classification Ties</p>
+                            {tieMapGraph.classificationEdges.length === 0 ? (
+                              <p className="text-xs text-zinc-500">
+                                No shared classifications across mapped races yet.
+                              </p>
+                            ) : (
+                              <ul className="space-y-1">
+                                {tieMapGraph.classificationEdges.map((edge, idx) => {
+                                  const leftName =
+                                    tieMapGraph.nodes.find((node) => node.id === edge.leftId)?.name ||
+                                    edge.leftId;
+                                  const rightName =
+                                    tieMapGraph.nodes.find((node) => node.id === edge.rightId)?.name ||
+                                    edge.rightId;
+                                  return (
+                                    <li
+                                      key={`tie-class-${edge.leftId}-${edge.rightId}-${idx}`}
+                                      className="text-[11px] text-zinc-300"
+                                    >
+                                      {`${leftName} <-> ${rightName} (shared classification: ${edge.labels.join(", ")})`}
+                                    </li>
+                                  );
+                                })}
+                              </ul>
+                            )}
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            </div>
+          </div>
+
+          <div className="mt-3 rounded-xl border border-emerald-300/30 bg-emerald-300/5 p-2 space-y-2">
+            <div className="text-[11px] font-semibold text-emerald-100">
+              Quick Move: All My Creatures
+            </div>
+            <select
+              value={bulkMoveWorldId}
+              onChange={(e) => setBulkMoveWorldId(e.target.value)}
+              className="w-full rounded-md border border-white/15 bg-black/50 px-2 py-1.5 text-xs text-zinc-100 outline-none focus:ring-2 focus:ring-emerald-400/40"
+              disabled={bulkMoveLoading}
+            >
+              <option value="">Select destination world</option>
+              {worlds.map((world) => {
+                const disabled = world.canEdit === false;
+                return (
+                  <option key={world.id} value={world.id} disabled={disabled}>
+                    {world.name}
+                  </option>
+                );
+              })}
+            </select>
+            <Button
+              variant="secondary"
+              size="sm"
+              type="button"
+              onClick={moveAllMyCreaturesToWorld}
+              disabled={bulkMoveLoading || !bulkMoveWorldId || myCreatureCount <= 0}
+            >
+              {bulkMoveLoading
+                ? "Moving..."
+                : `Move My ${myCreatureCount} Creatures`}
+            </Button>
+          </div>
+
+          {/* List */}
+          <div className="mt-2 flex-1 min-h-0 overflow-hidden rounded-2xl border border-white/10 bg-black/30">
+            <div className="flex items-center justify-between px-3 py-2 text-xs text-zinc-400 border-b border-white/10">
+              <span>{`Creatures: ${filteredList.length} shown / ${scopedRaces.length} scoped`}</span>
+              <span className="uppercase tracking-wide text-[10px] text-zinc-500">
+                Creature records
+              </span>
+            </div>
+
+            <div className="max-h-[420px] overflow-auto">
+              {filteredList.length === 0 ? (
+                <div className="px-3 py-6 text-center text-xs text-zinc-500">
+                  No creatures yet. Create your first lineage.
+                </div>
+              ) : (
+                <table className="w-full text-xs">
+                  <thead className="text-left text-zinc-400">
+                    <tr>
+                      <th className="px-3 py-1">Name</th>
+                      <th className="px-3 py-1">Classification</th>
+                      <th className="px-3 py-1">World</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filteredList.map((r) => {
+                      const idStr = String(r.id);
+                      const isSel = selectedId === idStr;
+                      const hierarchy = hierarchyByRaceId.get(idStr) ?? null;
+                      const depth = hierarchy?.lineageDepth ?? 0;
+                      return (
+                        <tr
+                          key={idStr}
+                          className={`border-t border-white/5 cursor-pointer hover:bg-white/5 ${
+                            isSel ? "bg-white/10" : ""
+                          }`}
+                          onClick={() => setSelectedId(idStr)}
+                        >
+                          <td className="px-3 py-1.5">
+                            <div
+                              className="flex items-center gap-2"
+                              style={{ paddingLeft: `${Math.min(depth, 8) * 12}px` }}
+                            >
+                              {depth > 0 ? (
+                                <span className="text-zinc-500 text-[10px]">|-</span>
+                              ) : null}
+                              <span>{r.name || "(unnamed)"}</span>
+                            </div>
+                          </td>
+                          <td className="px-3 py-1.5">
+                            {normalizeClassifications(r.classifications).join(", ") || "-"}
+                          </td>
+                          <td className="px-3 py-1.5 text-zinc-400">
+                            {r.worldName ||
+                              worlds.find((world) => world.id === r.worldId)?.name ||
+                              "—"}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              )}
+            </div>
+
+            {/* Quick rename + delete */}
+            <div className="flex items-center justify-between px-3 py-2 text-xs text-zinc-400 border-t border-white/10">
+              <div className="flex flex-col gap-1 flex-1 pr-2">
+                <span>Creature Name</span>
+                <input
+                  className="rounded-md border border-white/15 bg-black/50 px-2 py-1 text-xs text-zinc-100 outline-none"
+                  disabled={!selected}
+                  value={selected?.name ?? ""}
+                  onChange={(e) =>
+                    updateSelected({ name: e.target.value })
+                  }
+                />
+              </div>
+              <Button
+                variant="secondary"
+                size="sm"
+                type="button"
+                disabled={
+                  !selected ||
+                  !currentUser ||
+                  (
+                    currentUser.role?.toLowerCase() !== "admin" &&
+                    selected.createdBy !== currentUser.id
+                  )
+                }
+                onClick={deleteSelected}
+              >
+                Delete
+              </Button>
+            </div>
+
+            <div className="px-3 pb-3 pt-1 text-xs text-zinc-400 border-t border-white/10">
+              <div className="flex flex-col gap-1">
+                <span>Tagline</span>
+                <input
+                  className="rounded-md border border-white/15 bg-black/50 px-2 py-1 text-xs text-zinc-100 outline-none"
+                  disabled={!selected}
+                  value={selected?.tagline ?? ""}
+                  onChange={(e) =>
+                    updateSelected({ tagline: e.target.value })
+                  }
+                  placeholder="Stoic guardians of forgotten seas..."
+                />
+              </div>
+            </div>
+          </div>
+
+          {/* Admin-only batch uploader */}
+          {isAdmin && (
+            <div className="mt-4 rounded-2xl border border-amber-300/40 bg-amber-300/5 p-3 space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <div className="text-xs font-semibold text-amber-100">
+                  Admin · Batch Upload
+                </div>
+                <div className="flex gap-2">
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    type="button"
+                    onClick={handleParseBatch}
+                  >
+                    Parse preview
+                  </Button>
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    type="button"
+                    onClick={handleCommitBatch}
+                    disabled={!batchPreview.length || batchUploading}
+                  >
+                    {batchUploading ? "Uploading…" : "Commit to DB"}
+                  </Button>
+                </div>
+              </div>
+              <p className="text-[11px] text-amber-100/80">
+                Paste tab-separated rows from your sheet. First row must be
+                headers (Creature, Legacy Description, Physical Characteristics,
+                Physicial Description, Age Range, Size, Strenght Max, etc.).
+                Existing creatures are matched by name (case-insensitive).
+              </p>
+              <textarea
+                className="w-full h-32 rounded-lg border border-white/15 bg-black/60 p-2 text-xs text-zinc-100 font-mono"
+                value={batchText}
+                onChange={(e) => setBatchText(e.target.value)}
+                placeholder="Creature\tLegacy Description\tPhysical Characteristics\tPhysicial Description\tAge Range\tSize\tStrenght Max\tDexterity Max\tConstitution Max\tIntelligence Max\tWisdom Max\tCharisma Max\tBase Magic\tBase Movement\tRacial Quirk\tQuirk Success Effect\tQuirk Failure Effect\tSkill Bonuses\tCreature Special Abilities\tCommon Languages Known\tCommon Archtypes\tExamples of Use in Different Genres\tCultural Mindset\tOutlook On Magic"
+              />
+              {batchError && (
+                <p className="text-[11px] text-rose-300">
+                  {batchError}
+                </p>
+              )}
+              {batchPreview.length > 0 && !batchError && (
+                <div className="text-[11px] text-amber-100/90">
+                  Parsed{" "}
+                  <span className="font-semibold">
+                    {batchPreview.length}
+                  </span>{" "}
+                  creatures:&nbsp;
+                  {batchPreview
+                    .map((r) => r.name)
+                    .slice(0, 5)
+                    .join(", ")}
+                  {batchPreview.length > 5 ? "…" : ""}
+                </div>
+              )}
+            </div>
+          )}
+        </Card>
+
+        {/* Right column: main editor */}
+        <Card
+          padded={false}
+          className="rounded-3xl border border-white/10 bg-white/5 backdrop-blur p-5 shadow-2xl"
+        >
+          {loading ? (
+            <p className="text-sm text-zinc-400">Loading creatures...</p>
+          ) : !selected ? (
+            <p className="text-sm text-zinc-400">
+              Select a creature on the left or create a new one to begin
+              editing.
+            </p>
+          ) : (
+            <>
+              {/* Header: name + tabs + save */}
+              <div className="mb-4 flex flex-col md:flex-row md:items-start md:justify-between gap-3">
+                <div className="flex-1">
+                  <Input
+                    value={selected.name}
+                    onChange={(e) =>
+                      updateSelected({ name: e.target.value })
+                    }
+                    placeholder="Creature name (e.g., Serrian, Tideborn, Ashwalker...)"
+                  />
+                  <p className="mt-1 text-[11px] text-zinc-400">
+                    This is the label that will appear in character
+                    creation, sheets, and world docs.
+                  </p>
+                  <div className="mt-2 flex items-center gap-2">
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={selected.is_free ?? false}
+                        onChange={(e) =>
+                          updateSelected({
+                            is_free: e.target.checked,
+                          })
+                        }
+                        className="w-4 h-4 rounded border-white/20 bg-black/30 text-violet-500 focus:ring-violet-500/50"
+                      />
+                      <span className="text-sm text-zinc-300">
+                        Free (available to all users)
+                      </span>
+                    </label>
+                  </div>
+
+                  <div className="mt-3 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
+                    <FormField
+                      label="World"
+                      htmlFor="race-world"
+                      description="Attach this creature race to a Galaxy Forge world."
+                    >
+                      <select
+                        id="race-world"
+                        value={selected.worldId ?? ""}
+                        onChange={(e) => {
+                          const nextWorldId = e.target.value || null;
+                          const nextWorldName =
+                            worlds.find((world) => world.id === nextWorldId)?.name ?? null;
+                          updateSelected({
+                            worldId: nextWorldId,
+                            worldName: nextWorldName,
+                            parentRaceId: null,
+                            parent2RaceId: null,
+                          });
+                        }}
+                        disabled={readOnlyMode}
+                        className="w-full rounded-lg border border-white/10 bg-neutral-950/50 px-3 py-2 text-sm text-zinc-100 outline-none focus:ring-2 focus:ring-amber-400/40 disabled:opacity-60"
+                      >
+                        <option value="">(unassigned / global)</option>
+                        {worlds.map((world) => {
+                          const disabled =
+                            world.canEdit === false && selected.worldId !== world.id;
+                          return (
+                            <option key={world.id} value={world.id} disabled={disabled}>
+                              {world.name}
+                            </option>
+                          );
+                        })}
+                      </select>
+                    </FormField>
+
+                    <FormField
+                      label="Primary Parent Creature"
+                      htmlFor="race-parent-primary"
+                      description="Main lineage branch used for tree display and lineage pathing."
+                    >
+                      <select
+                        id="race-parent-primary"
+                        value={selected.parentRaceId ?? ""}
+                        onChange={(e) =>
+                          updateSelected({
+                            parentRaceId: e.target.value || null,
+                          })
+                        }
+                        disabled={readOnlyMode}
+                        className="w-full rounded-lg border border-white/10 bg-neutral-950/50 px-3 py-2 text-sm text-zinc-100 outline-none focus:ring-2 focus:ring-amber-400/40 disabled:opacity-60"
+                      >
+                        <option value="">(none - top-level branch)</option>
+                        {parentChoices.map((raceOption) => {
+                          const optionId = String(raceOption.id);
+                          if (optionId === String(selected.parent2RaceId ?? "")) {
+                            return null;
+                          }
+                          const optionMeta = hierarchyByRaceId.get(optionId) ?? null;
+                          const optionDepth = optionMeta?.lineageDepth ?? 0;
+                          const prefix =
+                            optionDepth > 0
+                              ? `${"  ".repeat(Math.min(optionDepth, 5))}- `
+                              : "";
+                          return (
+                            <option key={optionId} value={optionId}>
+                              {`${prefix}${raceOption.name || "(unnamed)"}`}
+                            </option>
+                          );
+                        })}
+                      </select>
+                    </FormField>
+
+                    <FormField
+                      label="Secondary Parent Creature"
+                      htmlFor="race-parent-secondary"
+                      description="Optional second parent for hybrid lineages."
+                    >
+                      <select
+                        id="race-parent-secondary"
+                        value={selected.parent2RaceId ?? ""}
+                        onChange={(e) =>
+                          updateSelected({
+                            parent2RaceId: e.target.value || null,
+                          })
+                        }
+                        disabled={readOnlyMode}
+                        className="w-full rounded-lg border border-white/10 bg-neutral-950/50 px-3 py-2 text-sm text-zinc-100 outline-none focus:ring-2 focus:ring-amber-400/40 disabled:opacity-60"
+                      >
+                        <option value="">(none)</option>
+                        {parentChoices.map((raceOption) => {
+                          const optionId = String(raceOption.id);
+                          if (optionId === String(selected.parentRaceId ?? "")) {
+                            return null;
+                          }
+                          const optionMeta = hierarchyByRaceId.get(optionId) ?? null;
+                          const optionDepth = optionMeta?.lineageDepth ?? 0;
+                          const prefix =
+                            optionDepth > 0
+                              ? `${"  ".repeat(Math.min(optionDepth, 5))}- `
+                              : "";
+                          return (
+                            <option key={optionId} value={optionId}>
+                              {`${prefix}${raceOption.name || "(unnamed)"}`}
+                            </option>
+                          );
+                        })}
+                      </select>
+                    </FormField>
+
+                    <FormField
+                      label="Classifications"
+                      htmlFor="race-classifications"
+                      description="Add one or more classification tags to this creature."
+                      className="md:col-span-2 xl:col-span-2"
+                    >
+                      <div className="space-y-3 rounded-lg border border-white/10 bg-neutral-950/30 p-3">
+                        {(selected.classifications ?? []).map((classification, idx) => (
+                          <div key={idx} className="flex items-center gap-2 flex-wrap">
+                            <select
+                              id={idx === 0 ? "race-classifications" : undefined}
+                              value={classification}
+                              onChange={(e) =>
+                                updateClassificationRow(idx, e.target.value)
+                              }
+                              disabled={readOnlyMode}
+                              className="w-[24ch] max-w-full min-h-[44px] rounded-lg border border-white/10 bg-neutral-950/50 px-3 py-2 text-sm text-zinc-100 outline-none focus:ring-2 focus:ring-amber-400/40 disabled:opacity-60"
+                            >
+                              <option value="">(select classification)</option>
+                              {classificationEditorOptions.map((label) => (
+                                <option key={`${idx}-${label}`} value={label}>
+                                  {label}
+                                </option>
+                              ))}
+                            </select>
+                            <Button
+                              variant="secondary"
+                              size="sm"
+                              type="button"
+                              onClick={() => removeClassificationRow(idx)}
+                              disabled={readOnlyMode}
+                            >
+                              Remove
+                            </Button>
+                          </div>
+                        ))}
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <Input
+                            value={newClassificationDraft}
+                            onChange={(e) => setNewClassificationDraft(e.target.value)}
+                            disabled={readOnlyMode}
+                            placeholder="Create new classification..."
+                            className="w-[24ch] max-w-full min-h-[44px]"
+                          />
+                          <Button
+                            variant="secondary"
+                            size="sm"
+                            type="button"
+                            onClick={addCustomClassification}
+                            disabled={readOnlyMode || !newClassificationDraft.trim()}
+                          >
+                            Add New
+                          </Button>
+                        </div>
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          type="button"
+                          onClick={addClassificationRow}
+                          disabled={readOnlyMode}
+                        >
+                          + Add Classification
+                        </Button>
+                      </div>
+                      <p className="mt-1 text-[11px] text-zinc-500">
+                        Top-level lineage path (reference only): {(selectedHierarchy?.lineagePath ?? [selected.name]).join(" > ")}
+                      </p>
+                      {selectedHierarchy?.hasLineageCycle ? (
+                        <p className="mt-1 text-[11px] text-rose-300">
+                          Lineage cycle detected. Choose a different parent.
+                        </p>
+                      ) : null}
+                    </FormField>
+                  </div>
+                </div>
+
+                <div className="shrink-0 flex flex-col items-end gap-2">
+                  {readOnlyMode && (
+                    <div className="text-xs text-amber-400 bg-amber-400/10 px-3 py-1 rounded border border-amber-400/30">
+                      Read-Only: Created by another user
+                    </div>
+                  )}
+                  <Tabs
+                    tabs={TAB_SECTIONS}
+                    activeId={activeTab}
+                    onChange={(id) => setActiveTab(id as TabKey)}
+                  />
+                  <div className="flex gap-2">
+                    <Button
+                      variant="primary"
+                      size="sm"
+                      type="button"
+                      onClick={saveSelected}
+                      disabled={readOnlyMode}
+                    >
+                      Save
+                    </Button>
+                  </div>
+                </div>
+              </div>
+
+              <div className="space-y-4">
+                {/* Identity & Lore */}
+                {activeTab === "identity" && (
+                  <div className="space-y-4">
+                    <FormField
+                      label="Legacy Description"
+                      htmlFor="legacy-description"
+                      description="If this creature already exists somewhere else, capture that legacy version here."
+                    >
+                      <textarea
+                        id="legacy-description"
+                        value={selected.def.legacy_description ?? ""}
+                        onChange={(e) =>
+                          updateDef(
+                            "legacy_description",
+                            e.target.value
+                          )
+                        }
+                        className="w-full min-h-[120px] rounded-lg border border-white/10 bg-neutral-950/50 px-3 py-2 text-sm text-zinc-100"
+                      />
+                    </FormField>
+
+                    <FormField
+                      label="Physical Characteristics"
+                      htmlFor="physical-characteristics"
+                      description="Common builds, features, and standout physical traits."
+                    >
+                      <textarea
+                        id="physical-characteristics"
+                        value={
+                          selected.def.physical_characteristics ?? ""
+                        }
+                        onChange={(e) =>
+                          updateDef(
+                            "physical_characteristics",
+                            e.target.value
+                          )
+                        }
+                        className="w-full min-h-[120px] rounded-lg border border-white/10 bg-neutral-950/50 px-3 py-2 text-sm text-zinc-100"
+                      />
+                    </FormField>
+
+                    <FormField
+                      label="Physical Description"
+                      htmlFor="physical-description"
+                      description="How would you describe this creature at the table to new players?"
+                    >
+                      <textarea
+                        id="physical-description"
+                        value={
+                          selected.def.physical_description ?? ""
+                        }
+                        onChange={(e) =>
+                          updateDef(
+                            "physical_description",
+                            e.target.value
+                          )
+                        }
+                        className="w-full min-h-[140px] rounded-lg border border-white/10 bg-neutral-950/50 px-3 py-2 text-sm text-zinc-100"
+                      />
+                    </FormField>
+
+                    <FormField
+                      label="Racial Quirk"
+                      htmlFor="racial-quirk"
+                      description="A signature quirk that can trigger special outcomes."
+                    >
+                      <Input
+                        id="racial-quirk"
+                        value={selected.def.racial_quirk ?? ""}
+                        onChange={(e) =>
+                          updateDef("racial_quirk", e.target.value)
+                        }
+                        placeholder="e.g., Tidal Memory, Ember Sight, Void Drift..."
+                      />
+                    </FormField>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <FormField
+                        label="Quirk Success Effect"
+                        htmlFor="quirk-success"
+                      >
+                        <textarea
+                          id="quirk-success"
+                          value={
+                            selected.def.quirk_success_effect ?? ""
+                          }
+                          onChange={(e) =>
+                            updateDef(
+                              "quirk_success_effect",
+                              e.target.value
+                            )
+                          }
+                          className="w-full min-h-[100px] rounded-lg border border-white/10 bg-neutral-950/50 px-3 py-2 text-sm text-zinc-100"
+                        />
+                      </FormField>
+
+                      <FormField
+                        label="Quirk Failure Effect"
+                        htmlFor="quirk-failure"
+                      >
+                        <textarea
+                          id="quirk-failure"
+                          value={
+                            selected.def.quirk_failure_effect ?? ""
+                          }
+                          onChange={(e) =>
+                            updateDef(
+                              "quirk_failure_effect",
+                              e.target.value
+                            )
+                          }
+                          className="w-full min-h-[100px] rounded-lg border border-white/10 bg-neutral-950/50 px-3 py-2 text-sm text-zinc-100"
+                        />
+                      </FormField>
+                    </div>
+
+                    <FormField
+                      label="Common Languages Known"
+                      htmlFor="languages"
+                      description="Typical languages this creature is expected to know."
+                    >
+                      <textarea
+                        id="languages"
+                        value={
+                          selected.def.common_languages_known ?? ""
+                        }
+                        onChange={(e) =>
+                          updateDef(
+                            "common_languages_known",
+                            e.target.value
+                          )
+                        }
+                        className="w-full min-h-[80px] rounded-lg border border-white/10 bg-neutral-950/50 px-3 py-2 text-sm text-zinc-100"
+                      />
+                    </FormField>
+
+                    <FormField
+                      label="Common Archetypes"
+                      htmlFor="archetypes"
+                      description="Typical roles this creature falls into (classes, archetypes, professions)."
+                    >
+                      <textarea
+                        id="archetypes"
+                        value={
+                          selected.def.common_archetypes ?? ""
+                        }
+                        onChange={(e) =>
+                          updateDef(
+                            "common_archetypes",
+                            e.target.value
+                          )
+                        }
+                        className="w-full min-h-[80px] rounded-lg border border-white/10 bg-neutral-950/50 px-3 py-2 text-sm text-zinc-100"
+                      />
+                    </FormField>
+
+                    <FormField
+                      label="Examples by Genre"
+                      htmlFor="examples-by-genre"
+                      description="How does this creature show up in fantasy, sci-fi, horror, etc.?"
+                    >
+                      <textarea
+                        id="examples-by-genre"
+                        value={
+                          selected.def.examples_by_genre ?? ""
+                        }
+                        onChange={(e) =>
+                          updateDef(
+                            "examples_by_genre",
+                            e.target.value
+                          )
+                        }
+                        className="w-full min-h-[100px] rounded-lg border border-white/10 bg-neutral-950/50 px-3 py-2 text-sm text-zinc-100"
+                      />
+                    </FormField>
+
+                    <FormField
+                      label="Cultural Mindset"
+                      htmlFor="cultural-mindset"
+                      description="What is their default outlook on life, conflict, community?"
+                    >
+                      <textarea
+                        id="cultural-mindset"
+                        value={
+                          selected.def.cultural_mindset ?? ""
+                        }
+                        onChange={(e) =>
+                          updateDef(
+                            "cultural_mindset",
+                            e.target.value
+                          )
+                        }
+                        className="w-full min-h-[100px] rounded-lg border border-white/10 bg-neutral-950/50 px-3 py-2 text-sm text-zinc-100"
+                      />
+                    </FormField>
+
+                    <FormField
+                      label="Outlook on Magic"
+                      htmlFor="outlook-on-magic"
+                      description="How does this creature view magic, psionics, tech, or other power sources?"
+                    >
+                      <textarea
+                        id="outlook-on-magic"
+                        value={
+                          selected.def.outlook_on_magic ?? ""
+                        }
+                        onChange={(e) =>
+                          updateDef(
+                            "outlook_on_magic",
+                            e.target.value
+                          )
+                        }
+                        className="w-full min-h-[100px] rounded-lg border border-white/10 bg-neutral-950/50 px-3 py-2 text-sm text-zinc-100"
+                      />
+                    </FormField>
+                  </div>
+                )}
+
+                {/* Attributes */}
+                {activeTab === "attributes" && (
+                  <div className="space-y-6">
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <FormField
+                        label="Age Range"
+                        htmlFor="age-range"
+                        description="Typical lifespan or playable age range."
+                      >
+                        <Input
+                          id="age-range"
+                          value={selected.attr.age_range ?? ""}
+                          onChange={(e) =>
+                            updateAttr("age_range", e.target.value)
+                          }
+                          placeholder="e.g., 15–90"
+                        />
+                      </FormField>
+
+                      <FormField
+                        label="Size"
+                        htmlFor="size"
+                        description="Choose the baseline size category."
+                      >
+                        <select
+                          id="size"
+                          value={selected.attr.size ?? ""}
+                          onChange={(e) =>
+                            updateAttr("size", e.target.value)
+                          }
+                          className="w-full rounded-lg border border-white/10 bg-neutral-950/50 px-3 py-2 text-sm text-zinc-100 outline-none focus:ring-2 focus:ring-amber-400/40"
+                        >
+                          <option value="">(choose)</option>
+                          {SIZE_OPTIONS.map((s) => (
+                            <option key={s} value={s}>
+                              {s}
+                            </option>
+                          ))}
+                        </select>
+                      </FormField>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                      <FormField label="STR Max" htmlFor="str-max">
+                        <Input
+                          id="str-max"
+                          type="number"
+                          value={selected.attr.strength_max ?? ""}
+                          onChange={(e) =>
+                            updateAttr(
+                              "strength_max",
+                              e.target.value
+                            )
+                          }
+                        />
+                      </FormField>
+                      <FormField label="DEX Max" htmlFor="dex-max">
+                        <Input
+                          id="dex-max"
+                          type="number"
+                          value={selected.attr.dexterity_max ?? ""}
+                          onChange={(e) =>
+                            updateAttr(
+                              "dexterity_max",
+                              e.target.value
+                            )
+                          }
+                        />
+                      </FormField>
+                      <FormField label="CON Max" htmlFor="con-max">
+                        <Input
+                          id="con-max"
+                          type="number"
+                          value={selected.attr.constitution_max ?? ""}
+                          onChange={(e) =>
+                            updateAttr(
+                              "constitution_max",
+                              e.target.value
+                            )
+                          }
+                        />
+                      </FormField>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                      <FormField label="INT Max" htmlFor="int-max">
+                        <Input
+                          id="int-max"
+                          type="number"
+                          value={
+                            selected.attr.intelligence_max ?? ""
+                          }
+                          onChange={(e) =>
+                            updateAttr(
+                              "intelligence_max",
+                              e.target.value
+                            )
+                          }
+                        />
+                      </FormField>
+                      <FormField label="WIS Max" htmlFor="wis-max">
+                        <Input
+                          id="wis-max"
+                          type="number"
+                          value={selected.attr.wisdom_max ?? ""}
+                          onChange={(e) =>
+                            updateAttr(
+                              "wisdom_max",
+                              e.target.value
+                            )
+                          }
+                        />
+                      </FormField>
+                      <FormField label="CHA Max" htmlFor="cha-max">
+                        <Input
+                          id="cha-max"
+                          type="number"
+                          value={selected.attr.charisma_max ?? ""}
+                          onChange={(e) =>
+                            updateAttr(
+                              "charisma_max",
+                              e.target.value
+                            )
+                          }
+                        />
+                      </FormField>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <FormField label="Base Magic" htmlFor="base-magic">
+                        <Input
+                          id="base-magic"
+                          type="number"
+                          value={selected.attr.base_magic ?? ""}
+                          onChange={(e) =>
+                            updateAttr(
+                              "base_magic",
+                              e.target.value
+                            )
+                          }
+                        />
+                      </FormField>
+                      <FormField
+                        label="Base Movement"
+                        htmlFor="base-movement"
+                      >
+                        <Input
+                          id="base-movement"
+                          type="number"
+                          value={selected.attr.base_movement ?? ""}
+                          onChange={(e) =>
+                            updateAttr(
+                              "base_movement",
+                              e.target.value
+                            )
+                          }
+                        />
+                      </FormField>
+                    </div>
+                  </div>
+                )}
+
+                {/* Bonuses */}
+                {activeTab === "bonuses" && (
+                  <div className="space-y-6">
+                    <section>
+                      <h3 className="text-lg font-semibold mb-3 text-zinc-200">
+                        Bonus Skills (Tier 1 only)
+                      </h3>
+                      <p className="text-xs text-zinc-400 mb-3">
+                        Select from Tier 1 skills in your skills library.
+                      </p>
+                      <div className="rounded-lg border border-white/15 bg-white/5 p-4">
+                        <div className="grid gap-2">
+                          {selected.bonusRows.map((row) => (
+                            <div
+                              key={row.slotIdx}
+                              className="flex items-center gap-3"
+                            >
+                              <select
+                                value={row.skillName}
+                                onChange={(e) =>
+                                  updateBonusRow(
+                                    row.slotIdx,
+                                    "skillName",
+                                    e.target.value
+                                  )
+                                }
+                                className="min-w-[300px] flex-1 rounded-lg border border-white/10 bg-neutral-950/50 px-3 py-2 text-sm text-zinc-100 outline-none focus:ring-2 focus:ring-amber-400/40"
+                              >
+                                <option value="">(none)</option>
+                                {tier1Skills.map((skill) => (
+                                  <option
+                                    key={skill.id}
+                                    value={skill.name}
+                                  >
+                                    {skill.name}
+                                  </option>
+                                ))}
+                              </select>
+                              <span className="text-sm text-zinc-400 shrink-0">
+                                pts
+                              </span>
+                              <input
+                                type="number"
+                                min={0}
+                                max={999}
+                                value={row.points}
+                                onChange={(e) =>
+                                  updateBonusRow(
+                                    row.slotIdx,
+                                    "points",
+                                    e.target.value
+                                  )
+                                }
+                                className="w-16 shrink-0 rounded-lg border border-white/10 bg-neutral-950/50 px-2 py-2 text-sm text-zinc-100 text-center outline-none focus:ring-2 focus:ring-amber-400/40"
+                              />
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    </section>
+
+                    <section>
+                      <h3 className="text-lg font-semibold mb-3 text-zinc-200">
+                        Creature Special Abilities
+                      </h3>
+                      <p className="text-xs text-zinc-400 mb-3">
+                        Select from special ability type skills in your
+                        skills library.
+                      </p>
+                      <div className="rounded-lg border border-white/15 bg-white/5 p-4">
+                        <div className="grid gap-2">
+                          {selected.specialRows.map((row) => (
+                            <div
+                              key={row.slotIdx}
+                              className="flex items-center gap-3"
+                            >
+                              <select
+                                value={row.skillName}
+                                onChange={(e) =>
+                                  updateSpecialRow(
+                                    row.slotIdx,
+                                    "skillName",
+                                    e.target.value
+                                  )
+                                }
+                                className="min-w-[300px] flex-1 rounded-lg border border-white/10 bg-neutral-950/50 px-3 py-2 text-sm text-zinc-100 outline-none focus:ring-2 focus:ring-amber-400/40"
+                              >
+                                <option value="">(none)</option>
+                                {specialAbilitySkills.map((skill) => (
+                                  <option
+                                    key={skill.id}
+                                    value={skill.name}
+                                  >
+                                    {skill.name}
+                                  </option>
+                                ))}
+                              </select>
+                              <span className="text-sm text-zinc-400 shrink-0">
+                                pts
+                              </span>
+                              <input
+                                type="number"
+                                min={0}
+                                max={999}
+                                value={row.points}
+                                onChange={(e) =>
+                                  updateSpecialRow(
+                                    row.slotIdx,
+                                    "points",
+                                    e.target.value
+                                  )
+                                }
+                                className="w-16 shrink-0 rounded-lg border border-white/10 bg-neutral-950/50 px-2 py-2 text-sm text-zinc-100 text-center outline-none focus:ring-2 focus:ring-amber-400/40"
+                              />
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    </section>
+                  </div>
+                )}
+
+                {/* Preview */}
+                {activeTab === "preview" && (
+                  <div>
+                    <FormField
+                      label="Preview"
+                      htmlFor="race-preview"
+                      description="Rough writeup for this creature, combining all other tabs."
+                    >
+                      <textarea
+                        id="race-preview"
+                        readOnly
+                        value={previewText}
+                        className="w-full h-[500px] rounded-lg border border-white/10 bg-neutral-950/70 px-3 py-2 text-xs text-zinc-200 font-mono"
+                      />
+                    </FormField>
+                  </div>
+                )}
+              </div>
+            </>
+          )}
+        </Card>
+      </section>
+    </main>
+  );
+}
+
