@@ -5,6 +5,8 @@ import { newSessionId } from "@/lib/auth";
 
 const COOKIE_NAME = "st_sess";
 const SESSION_TTL_DAYS = 14;
+const ALLOW_INSECURE_COOKIES =
+  process.env.ALLOW_INSECURE_COOKIES?.toLowerCase() === "true";
 
 // role precedence (leftmost = highest)
 const ROLE_ORDER = [
@@ -25,6 +27,17 @@ function pickPrimaryRole(roleCodes: string[]): string {
   return roleCodes[0] ?? "free";
 }
 
+function getSessionCookieOptions() {
+  return {
+    httpOnly: true,
+    sameSite: "lax" as const,
+    secure: ALLOW_INSECURE_COOKIES
+      ? false
+      : process.env.NODE_ENV === "production",
+    path: "/",
+  };
+}
+
 export async function createSession(userId: string) {
   const id = newSessionId();
   const now = new Date();
@@ -43,10 +56,7 @@ export async function createSession(userId: string) {
   // set cookie
   const c = await cookies();
   c.set(COOKIE_NAME, id, {
-    httpOnly: true,
-    sameSite: "lax",
-    secure: process.env.NODE_ENV === "production",
-    path: "/",
+    ...getSessionCookieOptions(),
     expires,
   });
 }
@@ -56,7 +66,10 @@ export async function destroySession() {
   const sid = c.get(COOKIE_NAME)?.value;
   if (sid) {
     await db.delete(schema.sessions).where(eq(schema.sessions.id, sid));
-    c.set(COOKIE_NAME, "", { path: "/", expires: new Date(0) });
+    c.set(COOKIE_NAME, "", {
+      ...getSessionCookieOptions(),
+      expires: new Date(0),
+    });
   }
 }
 
