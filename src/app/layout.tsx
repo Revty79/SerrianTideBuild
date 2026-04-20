@@ -6,6 +6,16 @@ import { NavigationPixie } from "@/components/NavigationPixie";
 export const metadata: Metadata = {
   title: "Serrian Tide",
   description: "Enter your imagination.",
+  manifest: "/manifest.webmanifest",
+  icons: {
+    icon: "/icon",
+    apple: "/apple-icon",
+  },
+  appleWebApp: {
+    title: "Serrian Tide",
+    capable: true,
+    statusBarStyle: "black-translucent",
+  },
 };
 
 export const viewport: Viewport = {
@@ -13,6 +23,7 @@ export const viewport: Viewport = {
   initialScale: 1,
   maximumScale: 5,
   userScalable: true,
+  themeColor: "#10245b",
 };
 
 export default function RootLayout({
