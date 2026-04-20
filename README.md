@@ -1,52 +1,90 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Serrian Tide Build
 
-## Getting Started
+Next.js 16 + PostgreSQL (Drizzle) app running on port `3003`.
 
-First, run the development server:
+## Local development
+
+1. Create `.env.local` from `.env.example`.
+2. Install dependencies:
+
+```bash
+npm ci
+```
+
+3. Run migrations + seed:
+
+```bash
+npm run db:bootstrap
+```
+
+4. Start dev server:
 
 ```bash
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3003](http://localhost:3003) with your browser to see the result.
+Open `http://localhost:3003`.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Docker deployment (server-ready)
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+This repository now includes:
 
-## Database workflow
+- `Dockerfile` for the app image
+- `docker-compose.yml` for app + PostgreSQL
+- `.env.docker.example` for server env setup
 
-This rebuild uses a single Drizzle-first workflow (no parallel custom SQL migration runner).
+### First-time server setup
 
-1. Create `.env.local` from `.env.example`
-2. Run `npm run db:migrate` to apply committed migrations
-3. Run `npm run db:seed` to seed default roles
+1. Copy env template and edit secrets:
 
-Useful DB commands:
+```bash
+cp .env.docker.example .env.docker
+```
+
+2. Update at minimum:
+- `POSTGRES_PASSWORD`
+- `DATABASE_URL` (must match the same DB credentials and keep host as `db`)
+
+3. Build and start in detached mode:
+
+```bash
+docker compose --env-file .env.docker up -d --build
+```
+
+On startup, the app container runs `npm run db:bootstrap` before `npm run start`, so schema + roles are initialized automatically.
+Postgres is kept internal to the Docker network by default (not exposed on host port `5432`).
+
+### Useful server commands
+
+View logs:
+
+```bash
+docker compose --env-file .env.docker logs -f
+```
+
+Restart services:
+
+```bash
+docker compose --env-file .env.docker restart
+```
+
+Stop services:
+
+```bash
+docker compose --env-file .env.docker down
+```
+
+Stop and remove DB volume (destructive):
+
+```bash
+docker compose --env-file .env.docker down -v
+```
+
+## Database workflow (non-Docker)
 
 - `npm run db:generate` generate new SQL migrations from `src/db/schema.ts`
 - `npm run db:migrate` apply generated migrations
 - `npm run db:push` push schema changes directly (dev only)
 - `npm run db:studio` open Drizzle Studio
+- `npm run db:seed` seed default roles
 - `npm run db:bootstrap` migrate + seed
-
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
